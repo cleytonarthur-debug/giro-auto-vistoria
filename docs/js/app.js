@@ -186,11 +186,9 @@
     return Promise.resolve(null);
   }
 
-  /** Com as 2 fotos no Drive (e nada mais na fila para o item), a IA roda em segundo plano. */
-  function posEnvio(op, it) {
-    if (!it || it.pulado || !it.idA || !it.idB || CK[op.n - 1].semFotos) return;
-    if (naFila(op.n, 'A') || naFila(op.n, 'B')) return;
-    if (op.tipo === 'foto' || op.dados.pulado === false) dispararAnalise(op.n);
+  function posEnvio() {
+    if (S.estado && !S.estado.pastaUrl) carregarEstado();   // 1ª foto criou a pasta do dia: pega o link dela
+    else atualizar();
   }
 
   function salvarItemFila(n, dados) {
@@ -201,32 +199,69 @@
     });
   }
 
-  // ------------------------------------------------------------ IA em segundo plano
-  function dispararAnalise(n) {
-    if (!navigator.onLine) return;
-    S.disparados[n] = Date.now();
-    var it = S.estado && S.estado.itens[n];
-    if (it && S.estado.temChave) { it.fase = 'analise'; it.faseTs = Date.now(); }
-    atualizar();
-    rpc('analisarItem', n).then(function (r) { aplicarItemServidor(r); atualizar(); })
-      .catch(function (e) { console.warn('analisarItem', n, e); });
+  // ------------------------------------------------------------ análise pelo Claude (grátis)
+  // O app não chama IA paga: ele monta a mensagem e abre o app do Claude, que lê a pasta no Drive.
+  function reconciliar() { buscarMiniaturas(); }
+
+  function mensagemClaude() {
+    var pasta = (S.estado && S.estado.pastaUrl) || '(pasta Vistorias do Giro Auto no meu Drive)';
+    var pend = CK.filter(function (c) { return !v(c.n).concluido; }).map(function (c) { return pad(c.n); });
+    var pul = CK.filter(function (c) { return v(c.n).pulado; }).map(function (c) { return pad(c.n) + ' (' + v(c.n).motivo + ')'; });
+    var meus = CK.filter(function (c) { return v(c.n).statusManual || v(c.n).obs; }).map(function (c) {
+      var x = v(c.n); return pad(c.n) + ': ' + (x.statusManual || '') + (x.obs ? ' — ' + x.obs : '');
+    });
+    return [
+      'Sou o Cleyton, projeto Giro Auto. Estou vistoriando o ' + OP.descricao + ' (placa ' + OP.placa + ') para o leilão.',
+      'Leia no meu Google Drive a pasta da vistoria: ' + pasta,
+      'Comece pelo arquivo _relatorio_final.json e depois veja as fotos (2 por item; a descrição de cada foto diz o item e o ângulo).',
+      'Planilha do projeto (premissas na aba Gastos): ' + BOOT.planilhaUrl,
+      'Para cada item: OK, Atenção ou Reprovado, nota de 0 a 10, o que você viu e o custo extra de reparo além do já previsto na aba Gastos.',
+      'No fim: nota geral (itens críticos com peso 3), veredito (Seguir para o leilão / Seguir com teto reduzido / Desistir do lote), ' +
+        'lance máximo pela fórmula da planilha com lucro mínimo de R$ 8.000, e o que eu ainda preciso olhar aqui no pátio.',
+      pend.length ? 'Itens ainda sem foto: ' + pend.join(', ') + '.' : '',
+      pul.length ? 'Itens pulados: ' + pul.join('; ') + '.' : '',
+      meus.length ? 'Minhas anotações: ' + meus.join('; ') + '.' : '',
+      'Depois grave o resultado de cada item na aba Visitação (colunas H e I) da planilha.'
+    ].filter(String).join('\n');
+  }
+  function linkClaude() { return 'https://claude.ai/new?q=' + encodeURIComponent(mensagemClaude()); }
+  function htmlBotaoClaude(classe, rotulo) {
+    return '<a class="btn ' + (classe || 'pri') + '" data-acao="claude" href="' + esc(linkClaude()) + '" target="_blank" rel="noopener">' + (rotulo || 'Analisar com o Claude') + '</a>';
   }
 
-  function reconciliar() {
-    if (!S.estado) return;
-    var agora = Date.now();
+  // Miniaturas que não estão neste celular (ex.: depois de recomeçar ou trocar de aparelho) vêm do Drive
+  function buscarMiniaturas() {
+    if (!S.estado || !navigator.onLine || S.buscandoMini) return Promise.resolve();
+    var faltam = [];
     CK.forEach(function (c) {
-      var s = S.estado.itens[c.n];
-      if (!s || c.semFotos || s.pulado || !s.idA || !s.idB) return;
-      if (naFila(c.n, 'A') || naFila(c.n, 'B')) return;
-      var hash = s.hashA + '|' + s.hashB;
-      var travado = s.fase === 'analise' && agora - Number(s.faseTs || 0) > 120000;
-      var precisa = s.fase !== 'analise' && s.hashAnalisado !== hash;
-      var semIa = S.estado.temChave && s.status === 'Aguardando análise no chat' && s.hashAnalisado === hash && !S.retentados[c.n];
-      if ((precisa || travado || semIa) && (!S.disparados[c.n] || agora - S.disparados[c.n] > 60000)) {
-        if (semIa) S.retentados[c.n] = true;
-        dispararAnalise(c.n);
-      }
+      var s = S.estado.itens[c.n] || {};
+      ['A', 'B'].forEach(function (sl) { if (s['id' + sl] && !S.thumbs[c.n + '_' + sl]) faltam.push({ n: c.n, slot: sl, id: s['id' + sl] }); });
+    });
+    if (!faltam.length) return Promise.resolve();
+    S.buscandoMini = true;
+    return rpc('miniaturas', faltam.slice(0, 24)).then(function (l) {
+      (l || []).forEach(function (m) {
+        if (!m.data) return;
+        S.thumbs[m.n + '_' + m.slot] = m.data;
+        put('thumbs', m.data, m.n + '_' + m.slot).catch(function () {});
+      });
+    }).catch(function () {}).then(function () { S.buscandoMini = false; atualizar(); });
+  }
+
+  // Botão Atualizar: puxa versão nova do app, reenvia o que está na fila e relê fotos e dados lançados
+  function atualizarTudo() {
+    if (S.atualizandoTudo) return;
+    if (!navigator.onLine) { toast('Sem internet. As fotos ficam guardadas e sobem quando o sinal voltar.'); return; }
+    S.atualizandoTudo = true; atualizar();
+    processarFila();
+    var versao = window.Atualizacao ? window.Atualizacao.verificar().catch(function () { return null; }) : Promise.resolve(null);
+    Promise.all([versao, carregarBoot(), carregarEstado()]).then(function (r) {
+      return buscarMiniaturas().then(function () { return r[0]; });
+    }).then(function (ver) {
+      S.atualizandoTudo = false;
+      if (ver && ver.nova) { toast('Versão nova ' + ver.remota + ' encontrada. Atualizando…'); setTimeout(function () { window.Atualizacao.aplicar(); }, 900); return; }
+      toast('Tudo atualizado' + (window.Atualizacao ? ' (versão ' + window.Atualizacao.VERSAO + ')' : '') + '.');
+      atualizar();
     });
   }
 
@@ -329,7 +364,7 @@
       statusManual: pend.statusManual !== undefined ? pend.statusManual : (s.statusManual || ''),
       respostas: pend.respostas || s.respostas || {},
       analise: s.fase === 'analise',
-      status: s.status || '', nota: s.nota, achados: s.achados || '', precisa: s.precisa || '',
+      status: s.status === 'Aguardando análise no chat' ? '' : (s.status || ''), nota: s.nota, achados: s.achados || '', precisa: s.precisa || '',
       fotoRuim: s.fotoRuim || ''
     };
     r.statusFinal = ['OK', 'Atenção', 'Reprovado'].indexOf(r.statusManual) >= 0 ? r.statusManual
@@ -411,8 +446,12 @@
 
   function topo(titulo, sub, voltar) {
     return '<header class="topo"><div class="linha">' + (voltar ? '<button class="voltar" data-acao="dash">‹ Lista</button>' : '') +
-      '<div><div class="marca">' + titulo + '</div>' + (sub ? '<div class="sub">' + sub + '</div>' : '') + '</div></div>' +
-      '<div id="pills">' + htmlPills() + '</div></header>';
+      '<div style="flex:1 1 auto;min-width:0"><div class="marca">' + titulo + '</div>' + (sub ? '<div class="sub">' + sub + '</div>' : '') + '</div>' +
+      (BOOT && ACESSO ? '<button class="atualizar" id="btnAtualizar" data-acao="atualizarTudo" aria-label="Atualizar">' + htmlBtnAtualizar() + '</button>' : '') +
+      '</div><div id="pills">' + htmlPills() + '</div></header>';
+  }
+  function htmlBtnAtualizar() {
+    return S.atualizandoTudo ? '<span class="giro"></span><small>Atualizando</small>' : '<span class="ic">⟳</span><small>Atualizar</small>';
   }
 
   function htmlPills() {
@@ -421,7 +460,7 @@
     if (!navigator.onLine) pills += '<span class="pill off">Sem internet — fotos guardadas no celular</span>';
     if (pend) pills += '<span class="pill alerta">' + (S.enviandoId ? '<span class="giro"></span> ' : '') + pend + (pend === 1 ? ' foto aguardando envio' : ' fotos aguardando envio') + '</span>';
     else if (S.estado) pills += '<span class="pill ok">Tudo enviado</span>';
-    if (S.estado && !S.estado.temChave) pills += '<span class="pill">IA desligada: análise no chat</span>';
+    if (S.atualizacao && S.atualizacao.nova) pills += '<span class="pill alerta">Versão nova: toque em Atualizar</span>';
     return pills;
   }
 
@@ -431,29 +470,23 @@
     if (S.tela === 'ajustes') return renderAjustes();
     if (S.tela === 'item') return renderItem();
     if (S.tela === 'final') return renderFinal();
-    if (S.tela === 'chat') return renderChat();
     return renderDash();
   }
 
   /** Atualização "leve" (polling, envio): não apaga o que o usuário está digitando. */
   function atualizar() {
     if (S.semAcesso || !ACESSO || !BOOT) return render();
-    if (S.tela === 'ajustes') {
-      var aj = document.getElementById('ajustes'), campo = document.getElementById('chaveia');
-      var digitado = campo ? campo.value : '';
-      if (aj) aj.innerHTML = htmlAjustes();
-      if (digitado) document.getElementById('chaveia').value = digitado;   // não apaga o que está sendo colado
-    }
+    if (S.tela === 'ajustes') { var aj = document.getElementById('ajustes'); if (aj) aj.innerHTML = htmlAjustes(); }
     var p = document.getElementById('pills');
     if (S.tela === 'dash') return renderDash();
     if (p) p.innerHTML = htmlPills();
+    var ba = document.getElementById('btnAtualizar'); if (ba) ba.innerHTML = htmlBtnAtualizar();
     if (S.tela === 'item') {
       var sl = document.getElementById('slots'); if (sl) sl.innerHTML = htmlSlots(S.n);
       var ia = document.getElementById('ia'); if (ia) ia.innerHTML = htmlIa(S.n);
       var pb = document.getElementById('pulo'); if (pb) pb.innerHTML = htmlPulo(S.n);
     }
     if (S.tela === 'final') { var f = document.getElementById('final'); if (f) f.innerHTML = htmlFinal(); }
-    if (S.tela === 'final' || S.tela === 'chat') { var h = document.getElementById('hist'); if (h) h.innerHTML = htmlHist(); }
   }
 
   // --- Tela 1: Dashboard
@@ -496,10 +529,10 @@
       '<main><div class="card">' +
       barra('Itens concluídos', feitos, TOTAL) + barra('Fotos enviadas', enviadas, FOTOS_TOTAL) +
       '<div class="prog"><div class="rot"><span>Fotos pendentes de envio</span><b class="' + (pend ? 'c-at' : 'c-ok') + '">' + pend + '</b></div></div>' +
-      '</div>' + htmlBannerAtualizacao() + htmlBannerIA() + resumo + html + '</main>' +
+      '</div>' + htmlBannerAtualizacao() + resumo + html + '</main>' +
       '<div class="rodape"><div class="dentro">' +
       '<button class="btn pri" data-acao="continuar">' + (feitos >= TOTAL ? 'Revisar vistoria' : 'Continuar vistoria') + '</button>' +
-      '<div class="lado"><button class="btn sec peq" data-acao="final">Finalizar</button><button class="btn sec peq" data-acao="chat">Conversa IA</button>' +
+      '<div class="lado"><button class="btn sec peq" data-acao="final">Finalizar</button>' + htmlBotaoClaude('sec peq', 'Claude') +
       '<button class="btn sec peq" data-acao="ajustes" style="flex:0 0 56px" aria-label="Ajustes">⚙</button></div>' +
       '</div></div>';
     window.scrollTo(0, y);
@@ -521,7 +554,7 @@
       corpo = '<div class="card angulo">' + svgAngulo(c.a) + '<div class="como" style="margin:0">' + esc(c.a) + '</div></div>' +
         '<div id="slots">' + htmlSlots(n) + '</div>';
     }
-    var status = '<div class="card"><label class="cap" style="margin-top:0">Resultado (opcional, substitui a IA)</label><div class="chips">' +
+    var status = '<div class="card"><label class="cap" style="margin-top:0">Seu resultado (opcional)</label><div class="chips">' +
       [['OK', 'ok'], ['Atenção', 'at'], ['Reprovado', 'rp']].map(function (s) {
         return '<button class="chip ' + s[1] + (x.statusManual === s[0] ? ' on' : '') + '" data-acao="manual" data-v="' + s[0] + '">' + s[0] + '</button>';
       }).join('') + '</div>' +
@@ -625,9 +658,9 @@
 
   function renderFinal() {
     app.innerHTML = topo('Resultado final', esc(OP.modelo) + ' · ' + esc(OP.placa), true) +
-      '<main><div id="final">' + htmlFinal() + '</div>' +
-      '<div class="area">Conversa</div><div class="card"><div class="msgs" id="hist">' + htmlHist() + '</div>' + htmlEnvio() + '</div></main>' +
-      '<div class="rodape"><div class="dentro"><button class="btn sec" data-acao="dash">Voltar à lista</button></div></div>';
+      '<main><div id="final">' + htmlFinal() + '</div></main>' +
+      '<div class="rodape"><div class="dentro">' + htmlBotaoClaude('pri') +
+      '<button class="btn sec peq" data-acao="dash">Voltar à lista</button></div></div>';
   }
 
   function htmlFinal() {
@@ -637,13 +670,17 @@
     if (S.carregandoFinal) out += '<div class="card"><span class="giro"></span> Calculando resultado…</div>';
     if (S.erroFinal) out += '<div class="aviso-foto">' + esc(S.erroFinal) + '</div>';
     if (!f) return out + (S.carregandoFinal ? '' : '<div class="card">Nenhum resultado ainda.</div>');
-    var corV = { 'Seguir para o leilão': 'c-ok', 'Seguir com teto reduzido': 'c-ouro', 'Desistir do lote': 'c-rp' }[f.veredito] || '';
-    out += '<div class="card" style="text-align:center"><div class="c-2">Nota geral</div><div class="notao ' + corNota(f.nota_geral) + '">' + (f.nota_geral === null ? '—' : f.nota_geral) + '</div>' +
+    var feitos = CK.filter(function (c) { return v(c.n).concluido; }).length;
+    var corV = { 'Seguir para o leilão': 'c-ok', 'Seguir com teto reduzido': 'c-ouro', 'Desistir do lote': 'c-rp' }[f.veredito] || 'c-ouro';
+    out += '<div class="card" style="text-align:center"><div class="c-2">Vistoria</div><div class="notao c-ouro">' + feitos + '/' + TOTAL + '</div>' +
+      '<div class="c-2">itens concluídos</div>' +
+      (f.nota_geral !== null ? '<div class="c-2" style="margin-top:10px">Nota geral</div><div class="notao ' + corNota(f.nota_geral) + '" style="font-size:44px">' + f.nota_geral + '</div>' : '') +
       '<div class="veredito ' + corV + '">' + esc(f.veredito) + '</div></div>';
-    out += '<div class="card"><div class="kv"><span>Lance máximo recomendado</span><b class="c-ouro">' + brl(f.lance_max) + '</b></div>' +
-      '<div class="kv"><span>Custo extra de reparo</span><b>' + brl(f.custo_extra_min) + ' a ' + brl(f.custo_extra_max) + '</b></div>' +
-      '<div class="kv"><span>Itens com nota</span><b>' + (f.itens_com_nota || 0) + '/' + TOTAL + '</b></div></div>';
-    if (f.resumo) out += '<div class="card">' + esc(f.resumo) + '</div>';
+    out += '<div class="card"><p class="como" style="margin-top:0">O relatório completo (itens, fotos e anotações) já está na pasta do Drive. ' +
+      'Toque em <b>Analisar com o Claude</b>: ele lê tudo, dá nota a cada item e calcula o lance, sem custo.</p>' +
+      '<div class="kv"><span>Lance máximo pela planilha' + (Number(f.custo_extra_max) ? '' : ' (sem reparos extras)') + '</span><b class="c-ouro">' + brl(f.lance_max) + '</b></div>' +
+      (Number(f.custo_extra_max) ? '<div class="kv"><span>Custo extra de reparo</span><b>' + brl(f.custo_extra_min) + ' a ' + brl(f.custo_extra_max) + '</b></div>' : '') +
+      '</div>';
     out += '<div class="area">O que mais precisa ver</div><div class="card"><ol class="lista">' +
       ((f.precisa_ver || []).length ? f.precisa_ver.slice(0, 12).map(function (t) { return '<li>' + esc(t) + '</li>'; }).join('') : '<li>Nada pendente</li>') + '</ol></div>';
     [['Reprovados', f.reprovados, 'c-rp'], ['Atenção', f.atencao, 'c-at']].forEach(function (g) {
@@ -660,46 +697,8 @@
     var pasta = S.estado && S.estado.pastaUrl;
     out += '<div class="lado" style="display:flex;gap:8px;margin-top:12px">' +
       (pasta ? '<a class="btn sec peq" href="' + esc(pasta) + '" target="_blank" rel="noopener">Abrir pasta no Drive</a>' : '') +
-      '<a class="btn sec peq" href="' + esc(BOOT.planilhaUrl) + '" target="_blank" rel="noopener">Abrir planilha</a></div>' +
-      '<button class="btn sec peq" style="margin-top:8px" data-acao="refinal"' + (S.carregandoFinal ? ' disabled' : '') + '>Recalcular resultado</button>';
+      '<a class="btn sec peq" href="' + esc(BOOT.planilhaUrl) + '" target="_blank" rel="noopener">Abrir planilha</a></div>';
     return out;
-  }
-
-  // --- Tela 4: Conversa
-  function renderChat() {
-    app.innerHTML = topo('Conversa', 'Pergunte sobre a vistoria. Ex.: "reavalie o item 08 com as fotos"', true) +
-      '<main><div class="card"><div class="msgs" id="hist">' + htmlHist() + '</div>' + htmlEnvio() + '</div></main>';
-    var h = document.getElementById('hist');
-    if (h && h.lastElementChild) h.lastElementChild.scrollIntoView({ block: 'end' });
-  }
-  function htmlHist() {
-    var l = (S.estado && S.estado.chat) || [];
-    var out = l.map(function (m) {
-      return '<div class="msg ' + (m.autor === 'IA' ? 'ia' : 'eu') + '"><small>' + esc(m.autor) + ' · ' + esc(m.ts) + '</small>' + esc(m.msg) + '</div>';
-    }).join('');
-    if (S.chatEnviando) out += '<div class="msg ia"><span class="giro"></span> Pensando…</div>';
-    return out || '<div class="c-2">Nenhuma mensagem ainda.</div>';
-  }
-  function htmlEnvio() {
-    return '<div class="envio"><textarea id="chatmsg" placeholder="Escreva sua pergunta"></textarea>' +
-      '<button class="btn pri" data-acao="enviarchat">Enviar</button></div>';
-  }
-  function enviarChat() {
-    var el = document.getElementById('chatmsg');
-    var t = el ? el.value.trim() : '';
-    if (!t || S.chatEnviando) return;
-    if (!navigator.onLine) { toast('Sem internet. Tente quando o sinal voltar.'); return; }
-    S.chatEnviando = true;
-    S.estado.chat = (S.estado.chat || []).concat([{ autor: 'Você', msg: t, ts: 'agora' }]);
-    el.value = '';
-    atualizar();
-    rpc('chat', t).then(function (r) { S.estado.chat = r.chat; })
-      .catch(function (e) { toast('Falha ao enviar: ' + (e && e.message ? e.message : e)); })
-      .then(function () {
-        S.chatEnviando = false; atualizar();
-        var h = document.getElementById('hist');
-        if (h && h.lastElementChild) h.lastElementChild.scrollIntoView({ block: 'end' });
-      });
   }
 
   // --- Sem link / primeira abertura sem internet
@@ -719,36 +718,15 @@
       '</div></main>';
   }
 
-  // --- Ajustes (versão, atualização e IA)
+  // --- Ajustes (versão, atalhos e recomeçar)
   function renderAjustes() {
     app.innerHTML = topo('Ajustes', esc(OP.modelo) + ' · ' + esc(OP.placa), true) +
       '<main id="ajustes">' + htmlAjustes() + '</main>';
   }
   function htmlAjustes() {
-    var A = window.Atualizacao, ia = S.ia || {}, out = '';
+    var A = window.Atualizacao, out = '';
     out += '<div class="area">App</div><div class="card"><div class="kv"><span>Versão instalada</span><b>' + esc(A ? A.VERSAO + ' · ' + A.DATA : '—') + '</b></div>' +
-      (S.atualizacao && S.atualizacao.nova ? '<div class="kv"><span>Versão nova</span><b class="c-ouro">' + esc(S.atualizacao.remota) + '</b></div>' : '') +
-      '</div>' +
-      (S.atualizacao && S.atualizacao.nova
-        ? '<button class="btn pri" data-acao="aplicarAtualizacao">Atualizar agora</button>'
-        : '<button class="btn sec peq" data-acao="buscarAtualizacao"' + (S.buscandoAtu ? ' disabled' : '') + '>' + (S.buscandoAtu ? 'Procurando…' : 'Buscar atualizações') + '</button>') +
-      (S.msgAtu ? '<p class="como" style="margin-top:8px">' + esc(S.msgAtu) + '</p>' : '');
-
-    var st;
-    if (S.testandoIA) st = '<span class="giro"></span> Testando a IA…';
-    else if (ia.ok) st = '<span class="c-ok">✓ IA funcionando</span> (' + esc(ia.modelo) + ')';
-    else if (ia.motivo === 'sem_chave') st = '<span class="c-at">IA desligada: falta a chave</span>';
-    else if (ia.motivo) st = '<span class="c-rp">IA com problema:</span> ' + esc(ia.mensagem || ia.motivo);
-    else st = '<span class="c-2">Ainda não testada</span>';
-    out += '<div class="area">Inteligência artificial (Claude)</div><div class="card">' +
-      '<p class="como" style="margin-top:0">A IA dá nota a cada item, calcula o resultado e conversa com você no pátio. ' +
-      'Sem ela, o app funciona igual (fotos e planilha) e a análise fica para o chat do Claude.</p>' +
-      '<div class="kv"><span>Situação</span><b>' + st + '</b></div>' +
-      '<button class="btn sec peq" style="margin-top:8px" data-acao="testarIA"' + (S.testandoIA ? ' disabled' : '') + '>Testar IA agora</button>' +
-      '<label class="cap" for="chaveia">Colar chave da IA (começa com sk-ant-)</label>' +
-      '<input type="password" id="chaveia" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="sk-ant-...">' +
-      '<button class="btn pri peq" style="margin-top:8px" data-acao="salvarIA"' + (S.testandoIA ? ' disabled' : '') + '>Salvar chave e testar</button>' +
-      '<p class="como" style="margin-top:8px">A chave fica guardada só no seu servidor do Google, nunca no celular.</p></div>';
+      '<p class="como" style="margin:8px 0 0">Para buscar versão nova, fotos e dados, use o botão <b>⟳ Atualizar</b> no topo.</p></div>';
 
     out += '<div class="area">Atalhos</div><div class="lado" style="display:flex;gap:8px">' +
       (S.estado && S.estado.pastaUrl ? '<a class="btn sec peq" href="' + esc(S.estado.pastaUrl) + '" target="_blank" rel="noopener">Pasta no Drive</a>' : '') +
@@ -765,33 +743,11 @@
         '<p class="como" style="margin:4px 0 0">Fica com ícone na tela inicial e abre mesmo sem sinal no pátio.</p>' +
         '<button class="btn pri peq" style="margin-top:8px" data-acao="instalar">Instalar app</button></div>';
     }
-    if (!S.atualizacao || !S.atualizacao.nova) return '';
-    return '<div class="card" style="border-color:var(--ouro)"><b class="c-ouro">Versão nova disponível (' + esc(S.atualizacao.remota) + ')</b>' +
-      '<button class="btn pri peq" style="margin-top:8px" data-acao="aplicarAtualizacao">Atualizar agora</button></div>';
+    return '';
   }
-  function htmlBannerIA() {
-    if (!S.estado || S.estado.temChave) return '';
-    return '<button class="it" data-acao="ajustes"><span class="em">🤖</span><span class="tx"><div class="nm">IA desligada</div>' +
-      '<div class="ds aviso">Toque para colar a chave da IA e ter nota e conversa no pátio.</div></span></button>';
-  }
-  function testarIA(chave) {
-    if (!navigator.onLine) { toast('Sem internet.'); return; }
-    S.testandoIA = true; atualizar();
-    (chave ? rpc('configurarIA', chave) : rpc('statusIA')).then(function (r) {
-      S.ia = r;
-      if (S.estado) S.estado.temChave = r.ok || (r.motivo !== 'sem_chave' && S.estado.temChave);
-      if (chave) toast(r.ok ? 'Chave salva. IA funcionando!' : 'A chave não funcionou: ' + (r.mensagem || r.motivo));
-    }).catch(function (e) { S.ia = { ok: false, motivo: 'erro', mensagem: e.message }; })
-      .then(function () { S.testandoIA = false; if (S.ia && S.ia.ok) { S.retentados = {}; carregarEstado(); } atualizar(); });
-  }
-  function buscarAtualizacao(silencioso) {
+  function buscarAtualizacao() {
     if (!window.Atualizacao) return;
-    S.buscandoAtu = !silencioso; if (!silencioso) atualizar();
-    window.Atualizacao.verificar().then(function (r) {
-      S.atualizacao = r;
-      S.msgAtu = r.nova ? '' : 'Você já está na versão mais nova.';
-    }).catch(function (e) { if (!silencioso) S.msgAtu = e.message; })
-      .then(function () { S.buscandoAtu = false; if (S.tela === 'dash' || S.tela === 'ajustes') atualizar(); });
+    window.Atualizacao.verificar().then(function (r) { S.atualizacao = r; atualizar(); }).catch(function () {});
   }
 
   function carregarBoot() {
@@ -847,12 +803,15 @@
     if (a === 'dash') { if (S.tela === 'item') return sairDoItem(function () { navegar('dash'); }); return navegar('dash'); }
     if (a === 'continuar') { var p = proximoPendente(0); return navegar('item', p || 1); }
     if (a === 'final') return navegar('final');
-    if (a === 'ajustes') { navegar('ajustes'); if (!S.ia) testarIA(); return; }
-    if (a === 'testarIA') return testarIA();
-    if (a === 'salvarIA') {
-      var ch = document.getElementById('chaveia').value.trim();
-      if (!/^sk-ant-/.test(ch)) { toast('A chave precisa começar com sk-ant-'); return; }
-      return testarIA(ch);
+    if (a === 'ajustes') return navegar('ajustes');
+    if (a === 'atualizarTudo') return atualizarTudo();
+    if (a === 'claude') {
+      // o link abre o app do Claude com a mensagem pronta; a mensagem também vai para a área de transferência
+      b.href = linkClaude();
+      try { navigator.clipboard.writeText(mensagemClaude()); } catch (e) { /* sem permissão: o link já leva a mensagem */ }
+      if (navigator.onLine) rpc('analisarFinal').then(function (r) { S.final = r; }).catch(function () {});   // relatório atualizado no Drive
+      toast('Abrindo o Claude com a mensagem pronta. Se ela não aparecer, cole (já está copiada).');
+      return;
     }
     if (a === 'instalar' && S.instalar) {
       var ev2 = S.instalar; S.instalar = null;
@@ -870,12 +829,8 @@
       }).then(function () { location.reload(); }, function (e) { toast('Não consegui recomeçar: ' + e.message); });
       return;
     }
-    if (a === 'buscarAtualizacao') return buscarAtualizacao(false);
     if (a === 'aplicarAtualizacao') return window.Atualizacao && window.Atualizacao.aplicar();
     if (a === 'tentarBoot') { S.erroBoot = ''; render(); return carregarBoot().then(function () { if (BOOT) iniciarVistoria(); }); }
-    if (a === 'refinal') return gerarFinal();
-    if (a === 'chat') return navegar('chat');
-    if (a === 'enviarchat') return enviarChat();
     if (a === 'proximo') return sairDoItem(irParaProximo);
     if (a === 'pular') return abrirPulo();
     if (a === 'fecharModal') return fecharModal();
@@ -908,9 +863,6 @@
       el.value = '';
     }
   });
-  document.addEventListener('keydown', function (ev) {
-    if (ev.key === 'Enter' && !ev.shiftKey && ev.target && ev.target.id === 'chatmsg') { ev.preventDefault(); enviarChat(); }
-  });
   window.addEventListener('online', function () { atualizar(); processarFila(); carregarEstado(); });
   window.addEventListener('offline', atualizar);
   window.addEventListener('beforeinstallprompt', function (ev) { ev.preventDefault(); S.instalar = ev; atualizar(); });
@@ -935,7 +887,7 @@
     render();                                   // abre instantâneo com o cache local
     processarFila();                            // reenvia sozinho o que ficou pendente
     carregarEstado();
-    buscarAtualizacao(true);                    // avisa se houver versão nova do app
+    buscarAtualizacao();                        // avisa se houver versão nova do app
   }
 
   // Dentro do APK (Capacitor) a tela vai até o topo: o cabeçalho desce para não ficar sob a barra do relógio

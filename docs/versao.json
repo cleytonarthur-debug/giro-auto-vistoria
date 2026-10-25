@@ -1,8 +1,8 @@
 {
-  "versao": "1.0.3",
+  "versao": "1.1.0",
   "data": "25/10/2026",
   "notas": [
-    "Cabeçalho abaixo da barra do relógio no APK",
-    "Campo da chave da IA no tamanho certo"
+    "Sem IA paga: análise grátis pelo Claude do celular",
+    "Botão Atualizar no topo (app, fotos e dados)"
   ]
 }
