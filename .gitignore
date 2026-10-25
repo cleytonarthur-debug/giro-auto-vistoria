@@ -1,0 +1,6 @@
+node_modules/
+package-lock.json
+# servidor (IDs da planilha, dados do veículo e chave do link) fica só no PC e no Apps Script
+backend/
+_antigo/
+REGISTRO-DO-PROJETO.md

@@ -1,0 +1,946 @@
+/* app.js — estado, IndexedDB, fila de envio com retry, compressão, polling e as telas
+   (lista, item, resultado, conversa e ajustes). Conversa com o servidor (Apps Script) por fetch. */
+(function () {
+  'use strict';
+
+  var BOOT = null, CK = [], TOTAL = 0, OP = {}, FOTOS_TOTAL = 0;   // vêm do servidor (boot) e ficam guardados
+  var ACESSO = null;                                               // {api, k} do link pessoal
+  var CHAVE_ACESSO = 'gav-acesso', CHAVE_BOOT = 'gav-boot';
+  function aplicarBoot(b) {
+    BOOT = b; CK = b.checklist; TOTAL = CK.length; OP = b.operacao;
+    FOTOS_TOTAL = CK.filter(function (i) { return !i.semFotos; }).length * 2;
+  }
+  function lerLS(k) { try { return JSON.parse(localStorage.getItem(k) || 'null'); } catch (e) { return null; } }
+  function gravarLS(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* sem espaço */ } }
+
+  /* Link: https://…/giro-auto-vistoria/#api=<url /exec>&k=<chave> */
+  function lerAcesso() {
+    var h = location.hash.replace(/^#/, '');
+    var q = new URLSearchParams(h);
+    var api = q.get('api'), k = q.get('k');
+    if (api && k && /^https:\/\/script\.google\.com\/.+\/exec$/.test(api)) {
+      gravarLS(CHAVE_ACESSO, { api: api, k: k });
+      history.replaceState(null, '', location.pathname);        // tira a chave da barra de endereço
+    }
+    return lerLS(CHAVE_ACESSO);
+  }
+  var ESPERAS = [2000, 5000, 10000];            // backoff das 3 tentativas
+  var PAUSA_LONGA = 30000;                      // depois das 3, tenta de novo a cada 30 s (ou ao reconectar)
+  var MAX_VIDEO = 20 * 1024 * 1024;
+
+  var S = {
+    tela: 'dash', n: 1,
+    estado: null,                 // vem do servidor (fonte da verdade)
+    local: {},                    // por item: {A:{hash}, B:{hash}, ok:{A,B}}
+    thumbs: {},                   // 'n_A' -> dataURL (miniatura local)
+    fila: [],                     // cópia em memória da fila do IndexedDB
+    enviandoId: null, processando: false, timerFila: null,
+    disparados: {}, retentados: {},
+    final: null, carregandoFinal: false, chatEnviando: false, erroFinal: ''
+  };
+
+  // ------------------------------------------------------------ IndexedDB
+  var DB = null, MEM = { fila: {}, thumbs: {}, kv: {} };
+  function abrirDB() {
+    return new Promise(function (res) {
+      try {
+        var r = indexedDB.open('giroauto_vistoria', 1);
+        r.onupgradeneeded = function () {
+          var d = r.result;
+          d.createObjectStore('fila', { keyPath: 'id' });
+          d.createObjectStore('thumbs');
+          d.createObjectStore('kv');
+        };
+        r.onsuccess = function () { DB = r.result; res(); };
+        r.onerror = function () { res(); };
+      } catch (e) { res(); }
+    });
+  }
+  function idb(store, modo, fn) {
+    if (!DB) return Promise.resolve(fn(null, MEM[store]));
+    return new Promise(function (res, rej) {
+      var t = DB.transaction(store, modo), st = t.objectStore(store), out;
+      var r = fn(st);
+      if (r && 'onsuccess' in r) r.onsuccess = function () { out = r.result; };
+      t.oncomplete = function () { res(out); };
+      t.onerror = function () { rej(t.error); };
+      t.onabort = function () { rej(t.error); };
+    });
+  }
+  function put(store, val, key) {
+    return idb(store, 'readwrite', function (st, mem) {
+      if (mem) { mem[key || val.id] = val; return; }
+      return key === undefined ? st.put(val) : st.put(val, key);
+    });
+  }
+  function get(store, key) { return idb(store, 'readonly', function (st, mem) { return mem ? mem[key] : st.get(key); }); }
+  function del(store, key) { return idb(store, 'readwrite', function (st, mem) { if (mem) { delete mem[key]; return; } return st.delete(key); }); }
+  function todos(store) {
+    if (!DB) return Promise.resolve(Object.keys(MEM[store]).map(function (k) { return { k: k, v: MEM[store][k] }; }));
+    return new Promise(function (res, rej) {
+      var out = [], t = DB.transaction(store, 'readonly');
+      var c = t.objectStore(store).openCursor();
+      c.onsuccess = function () { var cur = c.result; if (cur) { out.push({ k: cur.key, v: cur.value }); cur.continue(); } };
+      t.oncomplete = function () { res(out); };
+      t.onerror = function () { rej(t.error); };
+    });
+  }
+  function salvarLocal() { return put('kv', S.local, 'local').catch(function () {}); }
+
+  // ------------------------------------------------------------ servidor
+  var TEMPO_MAX = { uploadFoto: 120000, analisarItem: 120000, analisarFinal: 150000, chat: 150000, statusIA: 60000, configurarIA: 60000 };
+  function rpc(fn) {
+    var args = Array.prototype.slice.call(arguments, 1);
+    if (!ACESSO) return Promise.reject(new Error('Sem link de acesso'));
+    if (!navigator.onLine) return Promise.reject(new Error('Sem internet'));
+    var ctl = window.AbortController ? new AbortController() : null;
+    var timer = setTimeout(function () { if (ctl) ctl.abort(); }, TEMPO_MAX[fn] || 45000);
+    return fetch(ACESSO.api, {
+      method: 'POST', redirect: 'follow', signal: ctl ? ctl.signal : undefined,
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },     // text/plain: sem pré-verificação CORS
+      body: JSON.stringify({ k: ACESSO.k, fn: fn, args: args })
+    }).then(function (res) { return res.text(); }).then(function (txt) {
+      var d = null;
+      try { d = JSON.parse(txt); } catch (e) { /* resposta não é JSON */ }
+      if (!d) throw new Error(/<html/i.test(txt) ? 'O servidor respondeu uma página em vez de dados (implantação ou permissão).' : 'Resposta inválida do servidor.');
+      if (!d.ok) { var er = new Error(d.message || d.error); er.code = d.error; throw er; }
+      return d.r;
+    }, function (e) {
+      throw new Error(ctl && ctl.signal.aborted ? 'O servidor demorou demais para responder.' : 'Falha de conexão.');
+    }).then(function (r) { clearTimeout(timer); return r; }, function (e) {
+      clearTimeout(timer);
+      if (e.code === 'chave') { S.semAcesso = true; render(); }
+      throw e;
+    });
+  }
+
+  function aplicarItemServidor(it) {
+    if (!it || !S.estado) return;
+    S.estado.itens[it.n] = it;
+  }
+
+  function carregarEstado() {
+    return rpc('getEstado').then(function (e) {
+      S.estado = e;
+      put('kv', e, 'estado').catch(function () {});
+      if (e.resumo && !S.final) S.final = e.resumo;
+      reconciliar();
+      atualizar();
+    }).catch(function (err) { console.warn('getEstado', err); atualizar(); });
+  }
+
+  // ------------------------------------------------------------ fila de envio
+  function recarregarFila() {
+    return todos('fila').then(function (l) {
+      S.fila = l.map(function (x) { return x.v; }).sort(function (a, b) { return a.ts - b.ts; });
+    });
+  }
+  function fotosPendentes() { return S.fila.filter(function (o) { return o.tipo === 'foto'; }).length; }
+  function naFila(n, slot) { return S.fila.some(function (o) { return o.id === n + '_' + slot; }); }
+
+  function enfileirar(op) {
+    op.ts = Date.now(); op.tent = 0; op.esperaAte = 0;
+    return put('fila', op).then(recarregarFila).then(function () { atualizar(); processarFila(); });
+  }
+
+  function processarFila() {
+    if (S.processando) return;
+    S.processando = true;
+    clearTimeout(S.timerFila);
+    (function passo() {
+      recarregarFila().then(function () {
+        var agora = Date.now();
+        var op = S.fila.filter(function (o) { return !o.esperaAte || o.esperaAte <= agora; })[0];
+        if (!op || !navigator.onLine) {
+          S.processando = false; S.enviandoId = null; atualizar();
+          var prox = S.fila.reduce(function (m, o) { return Math.min(m, o.esperaAte || agora + 1000); }, Infinity);
+          if (prox !== Infinity) S.timerFila = setTimeout(processarFila, Math.max(1000, prox - agora));
+          return;
+        }
+        S.enviandoId = op.id; atualizar();
+        executar(op).then(function (it) {
+          return get('fila', op.id).then(function (atual) {     // só remove se não foi substituída (Refazer)
+            if (atual && atual.ts === op.ts) return del('fila', op.id);
+          }).then(recarregarFila).then(function () { posEnvio(op, it); });
+        }, function (err) {
+          console.warn('envio falhou', op.id, err);
+          op.tent = (op.tent || 0) + 1;
+          var espera = ESPERAS[op.tent - 1];
+          if (!espera) { op.tent = 0; espera = PAUSA_LONGA; }
+          op.esperaAte = Date.now() + espera;
+          return get('fila', op.id).then(function (atual) { if (atual && atual.ts === op.ts) return put('fila', op); });
+        }).then(passo, passo);
+      });
+    })();
+  }
+
+  function executar(op) {
+    if (op.tipo === 'foto') {
+      return blobParaBase64(op.blob).then(function (b64) {
+        return rpc('uploadFoto', { n: op.n, slot: op.slot, base64: b64, mime: op.mime, hash: op.hash, ts: new Date(op.ts).toISOString() });
+      }).then(function (r) { aplicarItemServidor(r.item); return r.item; });
+    }
+    if (op.tipo === 'item') {
+      return rpc('salvarItem', op.dados).then(function (it) { aplicarItemServidor(it); return it; });
+    }
+    return Promise.resolve(null);
+  }
+
+  /** Com as 2 fotos no Drive (e nada mais na fila para o item), a IA roda em segundo plano. */
+  function posEnvio(op, it) {
+    if (!it || it.pulado || !it.idA || !it.idB || CK[op.n - 1].semFotos) return;
+    if (naFila(op.n, 'A') || naFila(op.n, 'B')) return;
+    if (op.tipo === 'foto' || op.dados.pulado === false) dispararAnalise(op.n);
+  }
+
+  function salvarItemFila(n, dados) {
+    var id = 'item_' + n;
+    return get('fila', id).then(function (atual) {
+      var d = Object.assign({}, atual ? atual.dados : {}, dados, { n: n });
+      return enfileirar({ id: id, tipo: 'item', n: n, dados: d });
+    });
+  }
+
+  // ------------------------------------------------------------ IA em segundo plano
+  function dispararAnalise(n) {
+    if (!navigator.onLine) return;
+    S.disparados[n] = Date.now();
+    var it = S.estado && S.estado.itens[n];
+    if (it && S.estado.temChave) { it.fase = 'analise'; it.faseTs = Date.now(); }
+    atualizar();
+    rpc('analisarItem', n).then(function (r) { aplicarItemServidor(r); atualizar(); })
+      .catch(function (e) { console.warn('analisarItem', n, e); });
+  }
+
+  function reconciliar() {
+    if (!S.estado) return;
+    var agora = Date.now();
+    CK.forEach(function (c) {
+      var s = S.estado.itens[c.n];
+      if (!s || c.semFotos || s.pulado || !s.idA || !s.idB) return;
+      if (naFila(c.n, 'A') || naFila(c.n, 'B')) return;
+      var hash = s.hashA + '|' + s.hashB;
+      var travado = s.fase === 'analise' && agora - Number(s.faseTs || 0) > 120000;
+      var precisa = s.fase !== 'analise' && s.hashAnalisado !== hash;
+      var semIa = S.estado.temChave && s.status === 'Aguardando análise no chat' && s.hashAnalisado === hash && !S.retentados[c.n];
+      if ((precisa || travado || semIa) && (!S.disparados[c.n] || agora - S.disparados[c.n] > 60000)) {
+        if (semIa) S.retentados[c.n] = true;
+        dispararAnalise(c.n);
+      }
+    });
+  }
+
+  function emAnalise() {
+    if (!S.estado) return false;
+    return Object.keys(S.estado.itens).some(function (k) { return S.estado.itens[k].fase === 'analise'; });
+  }
+
+  // ------------------------------------------------------------ fotos: compressão
+  function blobParaBase64(blob) {
+    return new Promise(function (res, rej) {
+      var fr = new FileReader();
+      fr.onload = function () { res(String(fr.result).split(',')[1]); };
+      fr.onerror = function () { rej(fr.error); };
+      fr.readAsDataURL(blob);
+    });
+  }
+  function carregarImg(file) {
+    return new Promise(function (res, rej) {
+      var url = URL.createObjectURL(file), img = new Image();
+      img.onload = function () { res(img); };
+      img.onerror = function () { URL.revokeObjectURL(url); rej(new Error('imagem inválida')); };
+      img.src = url;
+    });
+  }
+  function canvasBlob(cv, q) {
+    return new Promise(function (res) { cv.toBlob(res, 'image/jpeg', q); });
+  }
+  function comprimir(file) {
+    var fonte = (window.createImageBitmap
+      ? createImageBitmap(file, { imageOrientation: 'from-image' })
+      : Promise.reject(new Error('sem createImageBitmap'))
+    ).catch(function () { return carregarImg(file); });
+    return fonte.then(function (src) {
+      var w = src.naturalWidth || src.width, h = src.naturalHeight || src.height;
+      var esc = Math.min(1, 1280 / Math.max(w, h));
+      var cv = document.createElement('canvas');
+      cv.width = Math.round(w * esc); cv.height = Math.round(h * esc);
+      cv.getContext('2d').drawImage(src, 0, 0, cv.width, cv.height);
+      var tc = document.createElement('canvas'), te = 200 / Math.max(cv.width, cv.height);
+      tc.width = Math.round(cv.width * te); tc.height = Math.round(cv.height * te);
+      tc.getContext('2d').drawImage(cv, 0, 0, tc.width, tc.height);
+      var thumb = tc.toDataURL('image/jpeg', 0.6);
+      if (src.close) src.close();
+      return canvasBlob(cv, 0.72).then(function (b) {
+        return b.size > 300 * 1024 ? canvasBlob(cv, 0.6) : b;     // garante ≤ 300 KB
+      }).then(function (b) { return { blob: b, thumb: thumb }; });
+    });
+  }
+  function hashBlob(blob) {
+    return blob.arrayBuffer().then(function (buf) {
+      if (window.crypto && crypto.subtle) {
+        return crypto.subtle.digest('SHA-256', buf).then(function (d) {
+          return Array.prototype.map.call(new Uint8Array(d), function (x) { return ('0' + x.toString(16)).slice(-2); }).join('').slice(0, 16);
+        });
+      }
+      var a = new Uint8Array(buf), h = 2166136261;
+      for (var i = 0; i < a.length; i += 7) { h ^= a[i]; h = Math.imul(h, 16777619); }
+      return (h >>> 0).toString(16) + '_' + a.length;
+    });
+  }
+
+  function receberArquivo(n, slot, file) {
+    if (!file) return;
+    var video = /^video\//.test(file.type);
+    var trabalho;
+    if (video) {
+      if (file.size > MAX_VIDEO) { toast('Vídeo grande demais (máx. 20 MB). Grave mais curto ou tire uma foto.'); return; }
+      trabalho = Promise.resolve({ blob: file, thumb: '' });
+    } else {
+      toast('Preparando foto…');
+      trabalho = comprimir(file);
+    }
+    trabalho.then(function (r) {
+      return hashBlob(r.blob).then(function (h) {
+        S.local[n] = S.local[n] || {};
+        S.local[n][slot] = { hash: h, video: video, ts: Date.now() };
+        S.local[n].ok = S.local[n].ok || {};
+        S.local[n].ok[slot] = false;
+        if (r.thumb) { S.thumbs[n + '_' + slot] = r.thumb; put('thumbs', r.thumb, n + '_' + slot).catch(function () {}); }
+        salvarLocal();
+        return enfileirar({ id: n + '_' + slot, tipo: 'foto', n: n, slot: slot, blob: r.blob, mime: r.blob.type || 'image/jpeg', hash: h });
+      });
+    }).then(function () { toast(video ? 'Vídeo salvo. Enviando…' : 'Foto salva. Enviando…'); })
+      .catch(function (e) { console.error(e); toast('Não consegui ler a foto. Tente de novo.'); });
+  }
+
+  // ------------------------------------------------------------ visão combinada de um item
+  function v(n) {
+    var c = CK[n - 1], s = (S.estado && S.estado.itens[n]) || {}, l = S.local[n] || {};
+    var filaItem = S.fila.filter(function (o) { return o.id === 'item_' + n; })[0];
+    var pend = filaItem ? filaItem.dados : {};
+    var r = {
+      c: c, s: s,
+      temA: !!(s.idA || l.A), temB: !!(s.idB || l.B),
+      envA: !!s.idA && !naFila(n, 'A'), envB: !!s.idB && !naFila(n, 'B'),
+      pulado: pend.pulado !== undefined ? pend.pulado : !!s.pulado,
+      motivo: pend.motivo || s.motivo || '',
+      obs: pend.obs !== undefined ? pend.obs : (s.obs || ''),
+      statusManual: pend.statusManual !== undefined ? pend.statusManual : (s.statusManual || ''),
+      respostas: pend.respostas || s.respostas || {},
+      analise: s.fase === 'analise',
+      status: s.status || '', nota: s.nota, achados: s.achados || '', precisa: s.precisa || '',
+      fotoRuim: s.fotoRuim || ''
+    };
+    r.statusFinal = ['OK', 'Atenção', 'Reprovado'].indexOf(r.statusManual) >= 0 ? r.statusManual
+      : (['OK', 'Atenção', 'Reprovado'].indexOf(r.status) >= 0 ? r.status : '');
+    if (c.semFotos) {
+      r.concluido = r.pulado || Object.keys(r.respostas).some(function (k) { return String(r.respostas[k] || '').trim(); });
+    } else {
+      r.concluido = r.pulado || (r.temA && r.temB);
+    }
+    r.incompleto = !c.semFotos && !r.pulado && (r.temA !== r.temB || s.fase === 'incompleto') && !(r.temA && r.temB);
+    return r;
+  }
+
+  function emoji(x) {
+    if (x.pulado) return '⏭';
+    if (x.analise) return '🟡';
+    if (x.c.semFotos && x.concluido && !x.statusFinal) return '🟢';
+    return { 'OK': '🟢', 'Atenção': '🟠', 'Reprovado': '🔴' }[x.statusFinal] || '⚪';
+  }
+  function corStatus(st) { return { 'OK': 'c-ok', 'Atenção': 'c-at', 'Reprovado': 'c-rp' }[st] || 'c-2'; }
+  function corNota(nt) { if (nt === null || nt === '' || nt === undefined) return 'c-2'; nt = Number(nt); return nt >= 7 ? 'c-ok' : nt >= 5 ? 'c-ouro' : 'c-rp'; }
+  function esc(t) { return String(t == null ? '' : t).replace(/[&<>"']/g, function (m) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]; }); }
+  function pad(n) { return ('0' + n).slice(-2); }
+  function brl(x) { return 'R$ ' + Math.round(Number(x) || 0).toString().replace(/\B(?=(\d{3})+(?!\d))/g, '.'); }
+  function temNota(x) { return x.nota !== '' && x.nota !== null && x.nota !== undefined; }
+
+  function proximoPendente(depois) {
+    for (var i = 0; i < TOTAL; i++) {
+      var n = ((depois || 0) + i) % TOTAL + 1;
+      if (!v(n).concluido) return n;
+    }
+    return 0;
+  }
+
+  // ------------------------------------------------------------ SVG de posição
+  function tipoAngulo(t) {
+    t = String(t || '');
+    if (/VOLANTE|PAINEL|BANCO|CARPETE|TRILHO|CINTO|PEDAIS|CONSOLE|hodômetro/i.test(t)) return 'interior';
+    if (/COFRE|MOTOR|VARETA|TAMPA|RESERVAT|BATERIA|TERMINAIS|CORREIA|MANGUEIRAS|CHICOTE|FILTRO|BLOCO|Fiação|Líquido/i.test(t)) return 'cofre';
+    if (/BAIXO|agachado|CHÃO|ESCAPAMENTO|CÁRTER|SOLEIRA/i.test(t)) return 'baixo';
+    if (/45°/.test(t)) return '45';
+    if (/LATERAL|perfil|PORTAS|LADO/i.test(t)) return 'lateral';
+    if (/TRASEIRA|LANTERNAS|PORTA-MALAS|ESTEPE|vigia|TETO/i.test(t)) return 'traseira';
+    return 'frente';
+  }
+  var CAM = '<circle cx="0" cy="0" r="6" fill="currentColor"/><rect x="-9" y="-5" width="18" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="2"/>';
+  function svgAngulo(t) {
+    var tipo = tipoAngulo(t), corpo = '';
+    var lado = '<path d="M10 44 L18 30 L40 24 L78 24 L96 32 L110 36 L110 46 L10 46 Z" fill="none" stroke="currentColor" stroke-width="2.5"/>' +
+      '<circle cx="32" cy="47" r="7" fill="#0B0E14" stroke="currentColor" stroke-width="2.5"/><circle cx="90" cy="47" r="7" fill="#0B0E14" stroke="currentColor" stroke-width="2.5"/>';
+    var frente = '<rect x="30" y="22" width="60" height="26" rx="6" fill="none" stroke="currentColor" stroke-width="2.5"/>' +
+      '<path d="M36 22 L42 10 L78 10 L84 22" fill="none" stroke="currentColor" stroke-width="2.5"/>' +
+      '<rect x="33" y="48" width="10" height="8" rx="2" fill="currentColor"/><rect x="77" y="48" width="10" height="8" rx="2" fill="currentColor"/>' +
+      '<circle cx="40" cy="32" r="4" fill="currentColor"/><circle cx="80" cy="32" r="4" fill="currentColor"/>';
+    if (tipo === 'lateral') corpo = lado + '<g transform="translate(60 8)">' + CAM + '</g><path d="M60 15 L60 20" stroke="currentColor" stroke-width="2"/>';
+    else if (tipo === 'baixo') corpo = lado + '<g transform="translate(60 62)">' + CAM + '</g><path d="M60 55 L60 50" stroke="currentColor" stroke-width="2"/>';
+    else if (tipo === '45') corpo = '<rect x="44" y="8" width="34" height="50" rx="9" fill="none" stroke="currentColor" stroke-width="2.5"/><path d="M48 20 L74 20" stroke="currentColor" stroke-width="2"/>' +
+      '<g transform="translate(20 6) rotate(-35)">' + CAM + '</g><path d="M28 12 L40 18" stroke="currentColor" stroke-width="2" stroke-dasharray="3 3"/>';
+    else if (tipo === 'interior') corpo = '<circle cx="60" cy="34" r="22" fill="none" stroke="currentColor" stroke-width="3"/><circle cx="60" cy="34" r="6" fill="currentColor"/>' +
+      '<path d="M38 34 L54 34 M66 34 L82 34 M60 40 L60 56" stroke="currentColor" stroke-width="3"/>';
+    else if (tipo === 'cofre') corpo = '<path d="M14 40 L30 12 L90 12 L106 40" fill="none" stroke="currentColor" stroke-width="2.5"/>' +
+      '<rect x="36" y="30" width="48" height="24" rx="3" fill="none" stroke="currentColor" stroke-width="2.5"/><path d="M44 30 L44 22 M56 30 L56 22 M68 30 L68 22 M80 30 L80 22" stroke="currentColor" stroke-width="2.5"/>';
+    else if (tipo === 'traseira') corpo = frente.replace(/<circle[^>]*>/g, '') + '<rect x="34" y="28" width="12" height="6" rx="2" fill="currentColor"/><rect x="74" y="28" width="12" height="6" rx="2" fill="currentColor"/><rect x="50" y="36" width="20" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="2"/>';
+    else corpo = frente;
+    return '<svg viewBox="0 0 120 70" aria-hidden="true">' + corpo + '</svg>';
+  }
+
+  // ------------------------------------------------------------ telas
+  var app = document.getElementById('app');
+
+  function navegar(tela, n) {
+    S.tela = tela;
+    if (n) S.n = n;
+    put('kv', { tela: tela, n: S.n }, 'pos').catch(function () {});
+    render();
+    window.scrollTo(0, 0);
+    if (tela === 'final') gerarFinal();
+  }
+
+  function topo(titulo, sub, voltar) {
+    return '<header class="topo"><div class="linha">' + (voltar ? '<button class="voltar" data-acao="dash">‹ Lista</button>' : '') +
+      '<div><div class="marca">' + titulo + '</div>' + (sub ? '<div class="sub">' + sub + '</div>' : '') + '</div></div>' +
+      '<div id="pills">' + htmlPills() + '</div></header>';
+  }
+
+  function htmlPills() {
+    var pend = fotosPendentes();
+    var pills = '';
+    if (!navigator.onLine) pills += '<span class="pill off">Sem internet — fotos guardadas no celular</span>';
+    if (pend) pills += '<span class="pill alerta">' + (S.enviandoId ? '<span class="giro"></span> ' : '') + pend + (pend === 1 ? ' foto aguardando envio' : ' fotos aguardando envio') + '</span>';
+    else if (S.estado) pills += '<span class="pill ok">Tudo enviado</span>';
+    if (S.estado && !S.estado.temChave) pills += '<span class="pill">IA desligada: análise no chat</span>';
+    return pills;
+  }
+
+  function render() {
+    if (S.semAcesso || !ACESSO) return renderSemAcesso();
+    if (!BOOT) return renderSemBoot();
+    if (S.tela === 'ajustes') return renderAjustes();
+    if (S.tela === 'item') return renderItem();
+    if (S.tela === 'final') return renderFinal();
+    if (S.tela === 'chat') return renderChat();
+    return renderDash();
+  }
+
+  /** Atualização "leve" (polling, envio): não apaga o que o usuário está digitando. */
+  function atualizar() {
+    if (S.semAcesso || !ACESSO || !BOOT) return render();
+    if (S.tela === 'ajustes') {
+      var aj = document.getElementById('ajustes'), campo = document.getElementById('chaveia');
+      var digitado = campo ? campo.value : '';
+      if (aj) aj.innerHTML = htmlAjustes();
+      if (digitado) document.getElementById('chaveia').value = digitado;   // não apaga o que está sendo colado
+    }
+    var p = document.getElementById('pills');
+    if (S.tela === 'dash') return renderDash();
+    if (p) p.innerHTML = htmlPills();
+    if (S.tela === 'item') {
+      var sl = document.getElementById('slots'); if (sl) sl.innerHTML = htmlSlots(S.n);
+      var ia = document.getElementById('ia'); if (ia) ia.innerHTML = htmlIa(S.n);
+      var pb = document.getElementById('pulo'); if (pb) pb.innerHTML = htmlPulo(S.n);
+    }
+    if (S.tela === 'final') { var f = document.getElementById('final'); if (f) f.innerHTML = htmlFinal(); }
+    if (S.tela === 'final' || S.tela === 'chat') { var h = document.getElementById('hist'); if (h) h.innerHTML = htmlHist(); }
+  }
+
+  // --- Tela 1: Dashboard
+  function renderDash() {
+    var feitos = 0, enviadas = 0, html = '', areaAtual = '';
+    CK.forEach(function (c) {
+      var x = v(c.n);
+      if (x.concluido) feitos++;
+      enviadas += (x.envA ? 1 : 0) + (x.envB ? 1 : 0);
+      if (c.area !== areaAtual) { areaAtual = c.area; html += '<div class="area">' + esc(c.area) + '</div>'; }
+      var ds, cls = 'ds';
+      if (x.pulado) ds = 'Pulado · ' + esc(x.motivo);
+      else if (x.fotoRuim) { ds = 'Refaça a foto: ' + esc(x.fotoRuim); cls += ' aviso'; }
+      else if (x.analise) ds = 'Em análise pela IA…';
+      else if (x.achados) ds = esc(x.achados);
+      else if (x.status) ds = esc(x.status);
+      else if (x.incompleto) { ds = 'Incompleto: falta foto'; cls += ' aviso'; }
+      else if (c.semFotos) ds = x.concluido ? 'Respondido' : 'Pendente · sem fotos';
+      else if (x.temA && x.temB) ds = (x.envA && x.envB) ? 'Fotos enviadas' : 'Fotos na fila de envio';
+      else ds = 'Pendente';
+      var mini = '';
+      if (!c.semFotos) {
+        ['A', 'B'].forEach(function (sl) {
+          var th = S.thumbs[c.n + '_' + sl];
+          mini += th ? '<img src="' + th + '" alt="">' : '<span>' + (x['tem' + sl] ? '' : '') + '</span>';
+        });
+      }
+      html += '<button class="it" data-acao="abrir" data-n="' + c.n + '"><span class="em">' + emoji(x) + '</span>' +
+        '<span class="tx"><div class="nm">' + pad(c.n) + ' · ' + esc(c.item) + (c.c ? '<span class="critico">CRÍTICO</span>' : '') + '</div>' +
+        '<div class="' + cls + '">' + ds + '</div></span>' +
+        '<span class="mini">' + mini + '</span>' +
+        (temNota(x) && !x.pulado ? '<span class="nota ' + corNota(x.nota) + '">' + x.nota + '</span>' : '') + '</button>';
+    });
+    var pend = fotosPendentes();
+    var resumo = S.final ? '<div class="card"><div class="lin" style="display:flex;justify-content:space-between;align-items:center;gap:10px">' +
+      '<div><div class="c-2" style="font-size:14px">Último resultado</div><div style="font-weight:800;font-size:18px">' + esc(S.final.veredito) + '</div></div>' +
+      '<div class="notao ' + corNota(S.final.nota_geral) + '" style="font-size:40px">' + (S.final.nota_geral === null ? '—' : S.final.nota_geral) + '</div></div></div>' : '';
+    var y = window.scrollY;
+    app.innerHTML = topo('GIRO AUTO · Vistoria · ' + esc(OP.modelo) + ' · ' + esc(OP.placa), esc(OP.descricao), false) +
+      '<main><div class="card">' +
+      barra('Itens concluídos', feitos, TOTAL) + barra('Fotos enviadas', enviadas, FOTOS_TOTAL) +
+      '<div class="prog"><div class="rot"><span>Fotos pendentes de envio</span><b class="' + (pend ? 'c-at' : 'c-ok') + '">' + pend + '</b></div></div>' +
+      '</div>' + htmlBannerAtualizacao() + htmlBannerIA() + resumo + html + '</main>' +
+      '<div class="rodape"><div class="dentro">' +
+      '<button class="btn pri" data-acao="continuar">' + (feitos >= TOTAL ? 'Revisar vistoria' : 'Continuar vistoria') + '</button>' +
+      '<div class="lado"><button class="btn sec peq" data-acao="final">Finalizar</button><button class="btn sec peq" data-acao="chat">Conversa IA</button>' +
+      '<button class="btn sec peq" data-acao="ajustes" style="flex:0 0 56px" aria-label="Ajustes">⚙</button></div>' +
+      '</div></div>';
+    window.scrollTo(0, y);
+  }
+  function barra(rot, a, b) {
+    return '<div class="prog"><div class="rot"><span>' + rot + '</span><b>' + a + '/' + b + '</b></div><div class="barra"><i style="width:' +
+      Math.round(100 * a / Math.max(b, 1)) + '%"></i></div></div>';
+  }
+
+  // --- Tela 2: Item
+  function renderItem() {
+    var n = S.n, c = CK[n - 1], x = v(n);
+    var corpo;
+    if (c.semFotos) {
+      corpo = '<div class="card">' + BOOT.perguntas.map(function (q) {
+        return '<label class="cap" for="r_' + q.k + '">' + esc(q.label) + '</label><input type="text" id="r_' + q.k + '" data-resp="' + q.k + '" value="' + esc(x.respostas[q.k] || '') + '" autocomplete="off">';
+      }).join('') + '</div>';
+    } else {
+      corpo = '<div class="card angulo">' + svgAngulo(c.a) + '<div class="como" style="margin:0">' + esc(c.a) + '</div></div>' +
+        '<div id="slots">' + htmlSlots(n) + '</div>';
+    }
+    var status = '<div class="card"><label class="cap" style="margin-top:0">Resultado (opcional, substitui a IA)</label><div class="chips">' +
+      [['OK', 'ok'], ['Atenção', 'at'], ['Reprovado', 'rp']].map(function (s) {
+        return '<button class="chip ' + s[1] + (x.statusManual === s[0] ? ' on' : '') + '" data-acao="manual" data-v="' + s[0] + '">' + s[0] + '</button>';
+      }).join('') + '</div>' +
+      '<label class="cap" for="obs">Observação</label><textarea id="obs" maxlength="500" placeholder="Opcional">' + esc(x.obs) + '</textarea></div>';
+    app.innerHTML = topo('Item ' + pad(n) + '/' + TOTAL + ' · ' + esc(c.area), '', true) +
+      '<main><h1 class="nome">' + esc(c.item) + (c.c ? ' <span class="critico">CRÍTICO</span>' : '') + '</h1>' +
+      '<p class="como">' + esc(c.como) + '</p>' +
+      '<div id="pulo">' + htmlPulo(n) + '</div>' +
+      '<div id="ia">' + htmlIa(n) + '</div>' + corpo + status + '</main>' +
+      '<div class="rodape"><div class="dentro"><div class="lado">' +
+      '<button class="btn sec" data-acao="pular">Pular item</button>' +
+      '<button class="btn pri" data-acao="proximo">' + (n < TOTAL ? 'Próximo ›' : 'Concluir ›') + '</button>' +
+      '</div></div></div>';
+  }
+
+  function htmlPulo(n) {
+    var x = v(n);
+    if (!x.pulado) return '';
+    return '<div class="faixa">⏭ Item pulado: <b>' + esc(x.motivo) + '</b> <button class="chip" style="min-height:40px;margin-left:6px" data-acao="despular">Desfazer</button></div>';
+  }
+
+  function htmlSlots(n) {
+    var c = CK[n - 1], x = v(n), l = S.local[n] || {}, out = '';
+    ['A', 'B'].forEach(function (sl) {
+      var ang = sl === 'A' ? c.a : c.b;
+      var accept = (c.aceitaVideo && sl === 'A') ? 'image/*,video/*' : 'image/*';
+      var input = '<input type="file" accept="' + accept + '" capture="environment" data-foto="' + sl + '">';
+      var tem = x['tem' + sl], th = S.thumbs[n + '_' + sl];
+      out += '<div class="slot"><div class="tt">FOTO ' + sl + '</div><div class="ang">' + esc(ang) + '</div>';
+      if (!tem) {
+        out += '<label class="captura"><span class="ic">📷</span>Tirar foto ' + sl + (accept.indexOf('video') >= 0 ? ' (ou vídeo até 60 s)' : '') + input + '</label>';
+      } else {
+        var est;
+        if (S.enviandoId === n + '_' + sl) est = '<span class="giro"></span> Enviando…';
+        else if (naFila(n, sl)) est = '⏳ Guardada no celular, aguardando envio';
+        else est = '<span class="c-ok">✓ Enviada ao Drive</span>';
+        var ok = l.ok && l.ok[sl];
+        var midia = th ? '<img class="foto' + (ok ? ' compacta' : '') + '" src="' + th + '" alt="Foto ' + sl + '">'
+          : '<div class="faixa">' + ((l[sl] && l[sl].video) ? '🎥 Vídeo gravado' : '📷 Foto registrada') + '</div>';
+        out += midia + '<div class="est">' + est + '</div><div class="acoes">' +
+          '<label class="btn sec peq">Refazer' + input + '</label>' +
+          (ok ? '' : '<button class="btn pri peq" data-acao="okfoto" data-slot="' + sl + '">OK</button>') + '</div>';
+      }
+      out += '</div>';
+    });
+    return out;
+  }
+
+  function htmlIa(n) {
+    var x = v(n), out = '';
+    if (x.fotoRuim) out += '<div class="aviso-foto">⚠️ Refaça a foto: ' + esc(x.fotoRuim) + '</div>';
+    if (x.analise) return out + '<div class="card ia"><span class="giro"></span> Analisando com IA… pode seguir para o próximo item.</div>';
+    if (!x.status && !temNota(x)) return out;
+    if (CK[n - 1].semFotos) return out;
+    out += '<div class="card ia"><div class="lin"><span class="st ' + corStatus(x.statusFinal) + '">' + emoji(x) + ' ' + esc(x.statusFinal || x.status) + '</span>' +
+      (temNota(x) ? '<span class="nota ' + corNota(x.nota) + '">' + x.nota + '/10</span>' : '') + '</div>' +
+      (x.achados ? '<p>' + esc(x.achados) + '</p>' : '') +
+      (x.precisa ? '<p class="c-ouro">Precisa ver: ' + esc(x.precisa) + '</p>' : '') +
+      (Number(x.s.cmax) ? '<p class="c-2">Reparo extra estimado: ' + brl(x.s.cmin) + ' a ' + brl(x.s.cmax) + '</p>' : '') + '</div>';
+    return out;
+  }
+
+  function lerCamposItem() {
+    var d = {}, n = S.n, x = v(n), c = CK[n - 1];
+    var o = document.getElementById('obs');
+    if (o && o.value !== x.obs) d.obs = o.value;
+    if (c.semFotos) {
+      var r = {}, mudou = false;
+      BOOT.perguntas.forEach(function (q) {
+        var el = document.querySelector('[data-resp="' + q.k + '"]');
+        r[q.k] = el ? el.value.trim() : '';
+        if (r[q.k] !== (x.respostas[q.k] || '')) mudou = true;
+      });
+      if (mudou) d.respostas = r;
+    }
+    return d;
+  }
+
+  function sairDoItem(destino) {
+    var n = S.n, x = v(n), c = CK[n - 1], d = lerCamposItem();
+    var l = S.local[n];
+    if (l && l.ok) { l.ok.A = true; l.ok.B = true; salvarLocal(); }    // sair confirma as fotos
+    if (!c.semFotos && !x.pulado && !(x.temA && x.temB) && S.estado && (S.estado.itens[n] || {}).fase !== 'incompleto') d.incompleto = true;
+    var p = Object.keys(d).length ? salvarItemFila(n, d) : Promise.resolve();
+    if (d.incompleto && !(x.temA || x.temB)) toast('Item ' + pad(n) + ' ficou incompleto (sem fotos).');
+    else if (d.incompleto) toast('Item ' + pad(n) + ' ficou incompleto (falta 1 foto).');
+    p.then(destino);
+  }
+
+  // --- Tela 3: Resultado final
+  function gerarFinal() {
+    if (S.carregandoFinal) return;
+    if (!navigator.onLine) { S.erroFinal = 'Sem internet: mostrando o último resultado salvo.'; atualizar(); return; }
+    S.carregandoFinal = true; S.erroFinal = ''; atualizar();
+    rpc('analisarFinal').then(function (r) {
+      S.final = r; if (S.estado) S.estado.resumo = r;
+    }).catch(function (e) {
+      S.erroFinal = 'Não consegui gerar agora: ' + (e && e.message ? e.message : e);
+    }).then(function () { S.carregandoFinal = false; atualizar(); });
+  }
+
+  function renderFinal() {
+    app.innerHTML = topo('Resultado final', esc(OP.modelo) + ' · ' + esc(OP.placa), true) +
+      '<main><div id="final">' + htmlFinal() + '</div>' +
+      '<div class="area">Conversa</div><div class="card"><div class="msgs" id="hist">' + htmlHist() + '</div>' + htmlEnvio() + '</div></main>' +
+      '<div class="rodape"><div class="dentro"><button class="btn sec" data-acao="dash">Voltar à lista</button></div></div>';
+  }
+
+  function htmlFinal() {
+    var f = S.final, out = '';
+    var pend = fotosPendentes();
+    if (pend) out += '<div class="aviso-foto">Ainda há ' + pend + ' foto(s) para enviar. O resultado pode ficar incompleto.</div>';
+    if (S.carregandoFinal) out += '<div class="card"><span class="giro"></span> Calculando resultado…</div>';
+    if (S.erroFinal) out += '<div class="aviso-foto">' + esc(S.erroFinal) + '</div>';
+    if (!f) return out + (S.carregandoFinal ? '' : '<div class="card">Nenhum resultado ainda.</div>');
+    var corV = { 'Seguir para o leilão': 'c-ok', 'Seguir com teto reduzido': 'c-ouro', 'Desistir do lote': 'c-rp' }[f.veredito] || '';
+    out += '<div class="card" style="text-align:center"><div class="c-2">Nota geral</div><div class="notao ' + corNota(f.nota_geral) + '">' + (f.nota_geral === null ? '—' : f.nota_geral) + '</div>' +
+      '<div class="veredito ' + corV + '">' + esc(f.veredito) + '</div></div>';
+    out += '<div class="card"><div class="kv"><span>Lance máximo recomendado</span><b class="c-ouro">' + brl(f.lance_max) + '</b></div>' +
+      '<div class="kv"><span>Custo extra de reparo</span><b>' + brl(f.custo_extra_min) + ' a ' + brl(f.custo_extra_max) + '</b></div>' +
+      '<div class="kv"><span>Itens com nota</span><b>' + (f.itens_com_nota || 0) + '/' + TOTAL + '</b></div></div>';
+    if (f.resumo) out += '<div class="card">' + esc(f.resumo) + '</div>';
+    out += '<div class="area">O que mais precisa ver</div><div class="card"><ol class="lista">' +
+      ((f.precisa_ver || []).length ? f.precisa_ver.slice(0, 12).map(function (t) { return '<li>' + esc(t) + '</li>'; }).join('') : '<li>Nada pendente</li>') + '</ol></div>';
+    [['Reprovados', f.reprovados, 'c-rp'], ['Atenção', f.atencao, 'c-at']].forEach(function (g) {
+      if (!g[1] || !g[1].length) return;
+      out += '<div class="area">' + g[0] + '</div>';
+      g[1].forEach(function (n) {
+        var c = CK[n - 1], x = v(n);
+        out += '<button class="it" data-acao="abrir" data-n="' + n + '"><span class="em">' + emoji(x) + '</span><span class="tx"><div class="nm">' + pad(n) + ' · ' + esc(c.item) +
+          (c.c ? '<span class="critico">CRÍTICO</span>' : '') + '</div><div class="ds">' + esc(x.achados) + '</div>' +
+          '<div class="galeria">' + ['A', 'B'].map(function (sl) { var t = S.thumbs[n + '_' + sl]; return t ? '<img src="' + t + '" alt="">' : ''; }).join('') + '</div></span>' +
+          (temNota(x) ? '<span class="nota ' + g[2] + '">' + x.nota + '</span>' : '') + '</button>';
+      });
+    });
+    var pasta = S.estado && S.estado.pastaUrl;
+    out += '<div class="lado" style="display:flex;gap:8px;margin-top:12px">' +
+      (pasta ? '<a class="btn sec peq" href="' + esc(pasta) + '" target="_blank" rel="noopener">Abrir pasta no Drive</a>' : '') +
+      '<a class="btn sec peq" href="' + esc(BOOT.planilhaUrl) + '" target="_blank" rel="noopener">Abrir planilha</a></div>' +
+      '<button class="btn sec peq" style="margin-top:8px" data-acao="refinal"' + (S.carregandoFinal ? ' disabled' : '') + '>Recalcular resultado</button>';
+    return out;
+  }
+
+  // --- Tela 4: Conversa
+  function renderChat() {
+    app.innerHTML = topo('Conversa', 'Pergunte sobre a vistoria. Ex.: "reavalie o item 08 com as fotos"', true) +
+      '<main><div class="card"><div class="msgs" id="hist">' + htmlHist() + '</div>' + htmlEnvio() + '</div></main>';
+    var h = document.getElementById('hist');
+    if (h && h.lastElementChild) h.lastElementChild.scrollIntoView({ block: 'end' });
+  }
+  function htmlHist() {
+    var l = (S.estado && S.estado.chat) || [];
+    var out = l.map(function (m) {
+      return '<div class="msg ' + (m.autor === 'IA' ? 'ia' : 'eu') + '"><small>' + esc(m.autor) + ' · ' + esc(m.ts) + '</small>' + esc(m.msg) + '</div>';
+    }).join('');
+    if (S.chatEnviando) out += '<div class="msg ia"><span class="giro"></span> Pensando…</div>';
+    return out || '<div class="c-2">Nenhuma mensagem ainda.</div>';
+  }
+  function htmlEnvio() {
+    return '<div class="envio"><textarea id="chatmsg" placeholder="Escreva sua pergunta"></textarea>' +
+      '<button class="btn pri" data-acao="enviarchat">Enviar</button></div>';
+  }
+  function enviarChat() {
+    var el = document.getElementById('chatmsg');
+    var t = el ? el.value.trim() : '';
+    if (!t || S.chatEnviando) return;
+    if (!navigator.onLine) { toast('Sem internet. Tente quando o sinal voltar.'); return; }
+    S.chatEnviando = true;
+    S.estado.chat = (S.estado.chat || []).concat([{ autor: 'Você', msg: t, ts: 'agora' }]);
+    el.value = '';
+    atualizar();
+    rpc('chat', t).then(function (r) { S.estado.chat = r.chat; })
+      .catch(function (e) { toast('Falha ao enviar: ' + (e && e.message ? e.message : e)); })
+      .then(function () {
+        S.chatEnviando = false; atualizar();
+        var h = document.getElementById('hist');
+        if (h && h.lastElementChild) h.lastElementChild.scrollIntoView({ block: 'end' });
+      });
+  }
+
+  // --- Sem link / primeira abertura sem internet
+  function renderSemAcesso() {
+    app.innerHTML = topo('GIRO AUTO · Vistoria', '', false) +
+      '<main><div class="card"><h1 class="nome">Abra pelo seu link de acesso</h1>' +
+      '<p class="como">Este app só funciona pelo link pessoal que o Claude te enviou (ele contém a sua chave). ' +
+      'Abra esse link no Chrome do celular uma vez; depois o app abre sozinho pelo ícone.</p>' +
+      (S.semAcesso ? '<div class="aviso-foto">O servidor recusou a chave deste aparelho. Abra o link pessoal de novo.</div>' : '') +
+      '</div></main>';
+  }
+  function renderSemBoot() {
+    app.innerHTML = topo('GIRO AUTO · Vistoria', '', false) +
+      '<main><div class="card"><h1 class="nome">Preparando o app…</h1>' +
+      '<p class="como">Na primeira vez o app precisa de internet para baixar o checklist. Depois ele abre mesmo sem sinal.</p>' +
+      (S.erroBoot ? '<div class="aviso-foto">' + esc(S.erroBoot) + '</div><button class="btn pri" data-acao="tentarBoot">Tentar de novo</button>' : '<span class="giro"></span>') +
+      '</div></main>';
+  }
+
+  // --- Ajustes (versão, atualização e IA)
+  function renderAjustes() {
+    app.innerHTML = topo('Ajustes', esc(OP.modelo) + ' · ' + esc(OP.placa), true) +
+      '<main id="ajustes">' + htmlAjustes() + '</main>';
+  }
+  function htmlAjustes() {
+    var A = window.Atualizacao, ia = S.ia || {}, out = '';
+    out += '<div class="area">App</div><div class="card"><div class="kv"><span>Versão instalada</span><b>' + esc(A ? A.VERSAO + ' · ' + A.DATA : '—') + '</b></div>' +
+      (S.atualizacao && S.atualizacao.nova ? '<div class="kv"><span>Versão nova</span><b class="c-ouro">' + esc(S.atualizacao.remota) + '</b></div>' : '') +
+      '</div>' +
+      (S.atualizacao && S.atualizacao.nova
+        ? '<button class="btn pri" data-acao="aplicarAtualizacao">Atualizar agora</button>'
+        : '<button class="btn sec peq" data-acao="buscarAtualizacao"' + (S.buscandoAtu ? ' disabled' : '') + '>' + (S.buscandoAtu ? 'Procurando…' : 'Buscar atualizações') + '</button>') +
+      (S.msgAtu ? '<p class="como" style="margin-top:8px">' + esc(S.msgAtu) + '</p>' : '');
+
+    var st;
+    if (S.testandoIA) st = '<span class="giro"></span> Testando a IA…';
+    else if (ia.ok) st = '<span class="c-ok">✓ IA funcionando</span> (' + esc(ia.modelo) + ')';
+    else if (ia.motivo === 'sem_chave') st = '<span class="c-at">IA desligada: falta a chave</span>';
+    else if (ia.motivo) st = '<span class="c-rp">IA com problema:</span> ' + esc(ia.mensagem || ia.motivo);
+    else st = '<span class="c-2">Ainda não testada</span>';
+    out += '<div class="area">Inteligência artificial (Claude)</div><div class="card">' +
+      '<p class="como" style="margin-top:0">A IA dá nota a cada item, calcula o resultado e conversa com você no pátio. ' +
+      'Sem ela, o app funciona igual (fotos e planilha) e a análise fica para o chat do Claude.</p>' +
+      '<div class="kv"><span>Situação</span><b>' + st + '</b></div>' +
+      '<button class="btn sec peq" style="margin-top:8px" data-acao="testarIA"' + (S.testandoIA ? ' disabled' : '') + '>Testar IA agora</button>' +
+      '<label class="cap" for="chaveia">Colar chave da IA (começa com sk-ant-)</label>' +
+      '<input type="password" id="chaveia" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="sk-ant-...">' +
+      '<button class="btn pri peq" style="margin-top:8px" data-acao="salvarIA"' + (S.testandoIA ? ' disabled' : '') + '>Salvar chave e testar</button>' +
+      '<p class="como" style="margin-top:8px">A chave fica guardada só no seu servidor do Google, nunca no celular.</p></div>';
+
+    out += '<div class="area">Atalhos</div><div class="lado" style="display:flex;gap:8px">' +
+      (S.estado && S.estado.pastaUrl ? '<a class="btn sec peq" href="' + esc(S.estado.pastaUrl) + '" target="_blank" rel="noopener">Pasta no Drive</a>' : '') +
+      '<a class="btn sec peq" href="' + esc(BOOT.planilhaUrl) + '" target="_blank" rel="noopener">Planilha</a></div>';
+    return out;
+  }
+  function htmlBannerAtualizacao() {
+    if (S.instalar) {
+      return '<div class="card" style="border-color:var(--ouro)"><b class="c-ouro">Instale o app no celular</b>' +
+        '<p class="como" style="margin:4px 0 0">Fica com ícone na tela inicial e abre mesmo sem sinal no pátio.</p>' +
+        '<button class="btn pri peq" style="margin-top:8px" data-acao="instalar">Instalar app</button></div>';
+    }
+    if (!S.atualizacao || !S.atualizacao.nova) return '';
+    return '<div class="card" style="border-color:var(--ouro)"><b class="c-ouro">Versão nova disponível (' + esc(S.atualizacao.remota) + ')</b>' +
+      '<button class="btn pri peq" style="margin-top:8px" data-acao="aplicarAtualizacao">Atualizar agora</button></div>';
+  }
+  function htmlBannerIA() {
+    if (!S.estado || S.estado.temChave) return '';
+    return '<button class="it" data-acao="ajustes"><span class="em">🤖</span><span class="tx"><div class="nm">IA desligada</div>' +
+      '<div class="ds aviso">Toque para colar a chave da IA e ter nota e conversa no pátio.</div></span></button>';
+  }
+  function testarIA(chave) {
+    if (!navigator.onLine) { toast('Sem internet.'); return; }
+    S.testandoIA = true; atualizar();
+    (chave ? rpc('configurarIA', chave) : rpc('statusIA')).then(function (r) {
+      S.ia = r;
+      if (S.estado) S.estado.temChave = r.ok || (r.motivo !== 'sem_chave' && S.estado.temChave);
+      if (chave) toast(r.ok ? 'Chave salva. IA funcionando!' : 'A chave não funcionou: ' + (r.mensagem || r.motivo));
+    }).catch(function (e) { S.ia = { ok: false, motivo: 'erro', mensagem: e.message }; })
+      .then(function () { S.testandoIA = false; if (S.ia && S.ia.ok) { S.retentados = {}; carregarEstado(); } atualizar(); });
+  }
+  function buscarAtualizacao(silencioso) {
+    if (!window.Atualizacao) return;
+    S.buscandoAtu = !silencioso; if (!silencioso) atualizar();
+    window.Atualizacao.verificar().then(function (r) {
+      S.atualizacao = r;
+      S.msgAtu = r.nova ? '' : 'Você já está na versão mais nova.';
+    }).catch(function (e) { if (!silencioso) S.msgAtu = e.message; })
+      .then(function () { S.buscandoAtu = false; if (S.tela === 'dash' || S.tela === 'ajustes') atualizar(); });
+  }
+
+  function carregarBoot() {
+    S.erroBoot = '';
+    return rpc('boot').then(function (b) {
+      gravarLS(CHAVE_BOOT, b);
+      var primeira = !BOOT;
+      aplicarBoot(b);
+      if (primeira) render();
+    }).catch(function (e) {
+      if (!BOOT) { S.erroBoot = 'Não consegui baixar o checklist: ' + e.message; render(); }
+    });
+  }
+
+  // ------------------------------------------------------------ modal pular
+  function abrirPulo() {
+    var m = document.getElementById('modal');
+    m.innerHTML = '<div class="caixa"><h2>Por que pular o item ' + pad(S.n) + '?</h2><div class="chips">' +
+      ['Pátio não deixou', 'Sem acesso', 'Não se aplica', 'Outro'].map(function (t) {
+        return '<button class="chip" data-acao="motivo" data-v="' + t + '">' + t + '</button>';
+      }).join('') + '</div><div id="outro" class="oculto"><label class="cap" for="motivoOutro">Qual motivo?</label><input type="text" id="motivoOutro">' +
+      '<button class="btn pri" style="margin-top:8px" data-acao="motivoOutro">Pular item</button></div>' +
+      '<button class="btn sec" style="margin-top:12px" data-acao="fecharModal">Cancelar</button></div>';
+    m.classList.remove('oculto');
+  }
+  function fecharModal() { var m = document.getElementById('modal'); m.classList.add('oculto'); m.innerHTML = ''; }
+  function pular(motivo) {
+    fecharModal();
+    var n = S.n, d = lerCamposItem();
+    d.pulado = true; d.motivo = motivo;
+    salvarItemFila(n, d).then(function () {
+      toast('Item ' + pad(n) + ' pulado.');
+      irParaProximo();
+    });
+  }
+  function irParaProximo() {
+    if (S.n < TOTAL) navegar('item', S.n + 1); else navegar('dash');
+  }
+
+  var tToast;
+  function toast(t) {
+    var el = document.getElementById('toast');
+    el.textContent = t; el.classList.remove('oculto');
+    clearTimeout(tToast); tToast = setTimeout(function () { el.classList.add('oculto'); }, 2600);
+  }
+
+  // ------------------------------------------------------------ eventos
+  document.addEventListener('click', function (ev) {
+    var b = ev.target.closest('[data-acao]');
+    if (!b) return;
+    var a = b.getAttribute('data-acao');
+    if (a === 'abrir') return navegar('item', Number(b.getAttribute('data-n')));
+    if (a === 'dash') { if (S.tela === 'item') return sairDoItem(function () { navegar('dash'); }); return navegar('dash'); }
+    if (a === 'continuar') { var p = proximoPendente(0); return navegar('item', p || 1); }
+    if (a === 'final') return navegar('final');
+    if (a === 'ajustes') { navegar('ajustes'); if (!S.ia) testarIA(); return; }
+    if (a === 'testarIA') return testarIA();
+    if (a === 'salvarIA') {
+      var ch = document.getElementById('chaveia').value.trim();
+      if (!/^sk-ant-/.test(ch)) { toast('A chave precisa começar com sk-ant-'); return; }
+      return testarIA(ch);
+    }
+    if (a === 'instalar' && S.instalar) {
+      var ev2 = S.instalar; S.instalar = null;
+      ev2.prompt();
+      ev2.userChoice.then(function (c) { if (c && c.outcome === 'accepted') toast('Pronto! O ícone Giro Auto vai aparecer na tela inicial.'); atualizar(); });
+      return;
+    }
+    if (a === 'buscarAtualizacao') return buscarAtualizacao(false);
+    if (a === 'aplicarAtualizacao') return window.Atualizacao && window.Atualizacao.aplicar();
+    if (a === 'tentarBoot') { S.erroBoot = ''; render(); return carregarBoot().then(function () { if (BOOT) iniciarVistoria(); }); }
+    if (a === 'refinal') return gerarFinal();
+    if (a === 'chat') return navegar('chat');
+    if (a === 'enviarchat') return enviarChat();
+    if (a === 'proximo') return sairDoItem(irParaProximo);
+    if (a === 'pular') return abrirPulo();
+    if (a === 'fecharModal') return fecharModal();
+    if (a === 'motivo') {
+      var mv = b.getAttribute('data-v');
+      if (mv === 'Outro') { document.getElementById('outro').classList.remove('oculto'); document.getElementById('motivoOutro').focus(); return; }
+      return pular(mv);
+    }
+    if (a === 'motivoOutro') { var t = document.getElementById('motivoOutro').value.trim(); return pular(t ? 'Outro: ' + t : 'Outro'); }
+    if (a === 'despular') { salvarItemFila(S.n, { pulado: false, motivo: '' }).then(renderItem); return; }
+    if (a === 'okfoto') {
+      var sl = b.getAttribute('data-slot');
+      S.local[S.n] = S.local[S.n] || {}; S.local[S.n].ok = S.local[S.n].ok || {}; S.local[S.n].ok[sl] = true;
+      salvarLocal(); atualizar(); return;
+    }
+    if (a === 'manual') {
+      var val = b.getAttribute('data-v'), x = v(S.n);
+      var novo = x.statusManual === val ? '' : val;
+      salvarItemFila(S.n, { statusManual: novo }).then(function () {
+        document.querySelectorAll('[data-acao="manual"]').forEach(function (c) { c.classList.toggle('on', c.getAttribute('data-v') === novo); });
+        atualizar();
+      });
+    }
+  });
+  document.addEventListener('change', function (ev) {
+    var el = ev.target;
+    if (el.matches && el.matches('input[type=file][data-foto]')) {
+      var f = el.files && el.files[0];
+      receberArquivo(S.n, el.getAttribute('data-foto'), f);
+      el.value = '';
+    }
+  });
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Enter' && !ev.shiftKey && ev.target && ev.target.id === 'chatmsg') { ev.preventDefault(); enviarChat(); }
+  });
+  window.addEventListener('online', function () { atualizar(); processarFila(); carregarEstado(); });
+  window.addEventListener('offline', atualizar);
+  window.addEventListener('beforeinstallprompt', function (ev) { ev.preventDefault(); S.instalar = ev; atualizar(); });
+  window.addEventListener('appinstalled', function () { S.instalar = null; atualizar(); });
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible') { processarFila(); carregarEstado(); }
+  });
+
+  // Polling a cada 4 s enquanto houver item "em análise"
+  setInterval(function () {
+    if (BOOT && navigator.onLine && document.visibilityState === 'visible' && emAnalise()) carregarEstado();
+  }, 4000);
+  // Reconciliação lenta (itens travados, IA ligada depois)
+  setInterval(function () { if (BOOT && navigator.onLine && document.visibilityState === 'visible') carregarEstado(); }, 60000);
+
+  // ------------------------------------------------------------ início
+  var iniciada = false;
+  function iniciarVistoria() {
+    if (iniciada) return;
+    iniciada = true;
+    S.tela = 'dash';
+    render();                                   // abre instantâneo com o cache local
+    processarFila();                            // reenvia sozinho o que ficou pendente
+    carregarEstado();
+    buscarAtualizacao(true);                    // avisa se houver versão nova do app
+  }
+
+  ACESSO = lerAcesso();
+  var bootGuardado = lerLS(CHAVE_BOOT);
+  if (bootGuardado) aplicarBoot(bootGuardado);
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(function () {});
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(function () {});   // o Android não apaga as fotos guardadas
+
+  abrirDB().then(function () {
+    return Promise.all([
+      get('kv', 'estado').then(function (e) { if (e) { S.estado = e; if (e.resumo) S.final = e.resumo; } }).catch(function () {}),
+      get('kv', 'local').then(function (l) { if (l) S.local = l; }).catch(function () {}),
+      todos('thumbs').then(function (l) { l.forEach(function (x) { S.thumbs[x.k] = x.v; }); }).catch(function () {}),
+      recarregarFila().catch(function () {})
+    ]);
+  }).then(function () {
+    if (!ACESSO) return render();
+    if (BOOT) { iniciarVistoria(); carregarBoot(); return; }   // checklist guardado: abre já, atualiza por trás
+    render();
+    return carregarBoot().then(function () { if (BOOT) iniciarVistoria(); });
+  });
+})();
