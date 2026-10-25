@@ -13,9 +13,9 @@
   function lerLS(k) { try { return JSON.parse(localStorage.getItem(k) || 'null'); } catch (e) { return null; } }
   function gravarLS(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* sem espaço */ } }
 
-  /* Link: https://…/giro-auto-vistoria/#api=<url /exec>&k=<chave> */
+  /* Link: https://…/giro-auto-vistoria/#api=<url /exec>&k=<chave>  (o APK abre com ?api=…&k=…) */
   function lerAcesso() {
-    var h = location.hash.replace(/^#/, '');
+    var h = location.hash.replace(/^#/, '') || location.search.replace(/^\?/, '');
     var q = new URLSearchParams(h);
     var api = q.get('api'), k = q.get('k');
     if (api && k && /^https:\/\/script\.google\.com\/.+\/exec$/.test(api)) {

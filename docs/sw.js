@@ -1,6 +1,6 @@
 /* Service worker: com internet o app busca a versão mais nova (assim as atualizações chegam
    sozinhas); com sinal ruim ou sem sinal usa a cópia guardada e abre na hora. */
-const CACHE = "giro-auto-vistoria-1.0.1";
+const CACHE = "giro-auto-vistoria-1.0.2";
 const SHELL = [
   "./", "index.html", "css/app.css", "fonts/fonts.css", "js/atualizacao.js", "js/app.js",
   "manifest.webmanifest", "icons/icon-192.png", "icons/icon-512.png", "icons/apple-touch-icon.png",
