@@ -85,7 +85,8 @@
   .chip.on.at { background: var(--laranja); border-color: var(--laranja); }
   .chip.on.ok { background: var(--verde); border-color: var(--verde); }
   label.cap { display: block; font-weight: 600; margin: 10px 0 6px; font-size: 15px; }
-  textarea, input[type=text] { width: 100%; background: var(--card2); color: var(--texto); border: 1px solid var(--borda); border-radius: 12px; padding: 12px; font-size: 16px; }
+  html.apk .topo { padding-top: calc(12px + max(env(safe-area-inset-top, 0px), 30px)); }  /* APK: abaixo da barra do relógio */
+  textarea, input[type=text], input[type=password] { width: 100%; background: var(--card2); color: var(--texto); border: 1px solid var(--borda); border-radius: 12px; padding: 12px; font-size: 16px; }
   textarea { min-height: 70px; resize: vertical; }
   .ia .lin { display: flex; align-items: center; gap: 10px; }
   .ia .st { font-weight: 800; font-size: 18px; }

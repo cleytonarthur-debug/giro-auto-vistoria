@@ -1,7 +1,8 @@
 {
-  "versao": "1.0.2",
+  "versao": "1.0.3",
   "data": "25/10/2026",
   "notas": [
-    "Acesso pelo APK"
+    "Cabeçalho abaixo da barra do relógio no APK",
+    "Campo da chave da IA no tamanho certo"
   ]
 }

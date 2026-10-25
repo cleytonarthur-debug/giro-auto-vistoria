@@ -938,6 +938,11 @@
     buscarAtualizacao(true);                    // avisa se houver versão nova do app
   }
 
+  // Dentro do APK (Capacitor) a tela vai até o topo: o cabeçalho desce para não ficar sob a barra do relógio
+  if (window.Capacitor || /[?&]k=/.test(location.search) || lerLS('gav-apk')) {
+    document.documentElement.classList.add('apk');
+    gravarLS('gav-apk', !!window.Capacitor || /[?&]k=/.test(location.search) || lerLS('gav-apk'));
+  }
   ACESSO = lerAcesso();
   var bootGuardado = lerLS(CHAVE_BOOT);
   if (bootGuardado) aplicarBoot(bootGuardado);
