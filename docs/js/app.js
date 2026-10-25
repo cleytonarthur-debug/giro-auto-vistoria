@@ -753,6 +753,10 @@
     out += '<div class="area">Atalhos</div><div class="lado" style="display:flex;gap:8px">' +
       (S.estado && S.estado.pastaUrl ? '<a class="btn sec peq" href="' + esc(S.estado.pastaUrl) + '" target="_blank" rel="noopener">Pasta no Drive</a>' : '') +
       '<a class="btn sec peq" href="' + esc(BOOT.planilhaUrl) + '" target="_blank" rel="noopener">Planilha</a></div>';
+    out += '<div class="area">Recomeçar</div><div class="card"><p class="como" style="margin-top:0">Apaga os resultados da planilha e do celular ' +
+      '(para limpar testes antes da vistoria real). As fotos já enviadas continuam no Drive.</p>' +
+      '<button class="btn sec peq" data-acao="zerar"' + (fotosPendentes() ? ' disabled' : '') + '>Recomeçar vistoria</button>' +
+      (fotosPendentes() ? '<p class="como" style="margin-top:8px">Espere as fotos pendentes subirem.</p>' : '') + '</div>';
     return out;
   }
   function htmlBannerAtualizacao() {
@@ -854,6 +858,16 @@
       var ev2 = S.instalar; S.instalar = null;
       ev2.prompt();
       ev2.userChoice.then(function (c) { if (c && c.outcome === 'accepted') toast('Pronto! O ícone Giro Auto vai aparecer na tela inicial.'); atualizar(); });
+      return;
+    }
+    if (a === 'zerar') {
+      if (!window.confirm('Apagar todos os resultados desta vistoria (planilha e celular)? As fotos continuam no Drive.')) return;
+      rpc('zerarVistoria', 'RECOMECAR').then(function () {
+        return Promise.all([
+          idb('thumbs', 'readwrite', function (st, mem) { if (mem) { MEM.thumbs = {}; return; } return st.clear(); }),
+          del('kv', 'local'), del('kv', 'estado')
+        ]);
+      }).then(function () { location.reload(); }, function (e) { toast('Não consegui recomeçar: ' + e.message); });
       return;
     }
     if (a === 'buscarAtualizacao') return buscarAtualizacao(false);
