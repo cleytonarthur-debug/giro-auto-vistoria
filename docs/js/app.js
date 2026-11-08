@@ -5,7 +5,10 @@
 
   var BOOT = null, CK = [], TOTAL = 0, OP = {}, FOTOS_TOTAL = 0;   // vêm do servidor (boot) e ficam guardados
   var ACESSO = null;                                               // {api, k} do link pessoal
-  var CHAVE_ACESSO = 'gav-acesso', CHAVE_BOOT = 'gav-boot';
+  var CHAVE_ACESSO = 'gav-acesso', CHAVE_VEICULO = 'gav-veiculo';
+  // null = carro padrão. Cada carro tem os próprios dados no celular (checklist, fotos e fila).
+  var VEICULO = lerLS(CHAVE_VEICULO);
+  var CHAVE_BOOT = VEICULO ? 'gav-boot-' + VEICULO : 'gav-boot';
   function aplicarBoot(b) {
     BOOT = b; CK = b.checklist; TOTAL = CK.length; OP = b.operacao;
     FOTOS_TOTAL = CK.filter(function (i) { return !i.semFotos; }).length * 2;
@@ -44,7 +47,7 @@
   function abrirDB() {
     return new Promise(function (res) {
       try {
-        var r = indexedDB.open('giroauto_vistoria', 1);
+        var r = indexedDB.open(VEICULO ? 'giroauto_vistoria_' + VEICULO : 'giroauto_vistoria', 1);
         r.onupgradeneeded = function () {
           var d = r.result;
           d.createObjectStore('fila', { keyPath: 'id' });
@@ -88,7 +91,7 @@
   function salvarLocal() { return put('kv', S.local, 'local').catch(function () {}); }
 
   // ------------------------------------------------------------ servidor
-  var TEMPO_MAX = { uploadFoto: 120000, analisarItem: 120000, analisarFinal: 150000, chat: 150000, statusIA: 60000, configurarIA: 60000 };
+  var TEMPO_MAX = { salvarVeiculo: 90000, uploadFoto: 120000, analisarItem: 120000, analisarFinal: 150000, chat: 150000, statusIA: 60000, configurarIA: 60000 };
   function rpc(fn) {
     var args = Array.prototype.slice.call(arguments, 1);
     if (!ACESSO) return Promise.reject(new Error('Sem link de acesso'));
@@ -98,7 +101,7 @@
     return fetch(ACESSO.api, {
       method: 'POST', redirect: 'follow', signal: ctl ? ctl.signal : undefined,
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },     // text/plain: sem pré-verificação CORS
-      body: JSON.stringify({ k: ACESSO.k, fn: fn, args: args })
+      body: JSON.stringify({ k: ACESSO.k, v: VEICULO, fn: fn, args: args })
     }).then(function (res) { return res.text(); }).then(function (txt) {
       var d = null;
       try { d = JSON.parse(txt); } catch (e) { /* resposta não é JSON */ }
@@ -204,6 +207,7 @@
   function reconciliar() { buscarMiniaturas(); }
 
   function mensagemClaude() {
+    var D = BOOT.veiculo || { temGastos: true, temVisitacao: true };
     var pasta = (S.estado && S.estado.pastaUrl) || '(pasta Vistorias do Giro Auto no meu Drive)';
     var pend = CK.filter(function (c) { return !v(c.n).concluido; }).map(function (c) { return pad(c.n); });
     var pul = CK.filter(function (c) { return v(c.n).pulado; }).map(function (c) { return pad(c.n) + ' (' + v(c.n).motivo + ')'; });
@@ -214,14 +218,18 @@
       'Sou o Cleyton, projeto Giro Auto. Estou vistoriando o ' + OP.descricao + ' (placa ' + OP.placa + ') para o leilão.',
       'Leia no meu Google Drive a pasta da vistoria: ' + pasta,
       'Comece pelo arquivo _relatorio_final.json e depois veja as fotos (2 por item; a descrição de cada foto diz o item e o ângulo).',
-      'Planilha do projeto (premissas na aba Gastos): ' + BOOT.planilhaUrl,
-      'Para cada item: OK, Atenção ou Reprovado, nota de 0 a 10, o que você viu e o custo extra de reparo além do já previsto na aba Gastos.',
+      (D.temGastos ? 'Planilha do projeto (premissas na aba Gastos): ' : 'Planilha deste carro: ') + BOOT.planilhaUrl,
+      D.chassi || D.motor ? 'Chassi: ' + (D.chassi || 'não informado') + ' · Motor: ' + (D.motor || 'não informado') + '.' : '',
+      D.leilao ? 'Leilão: ' + D.leilao + '.' : '',
+      D.danoConhecido ? 'Dano conhecido: ' + D.danoConhecido + '.' : '',
+      !D.temGastos ? 'Venda prevista: ' + (D.venda ? 'R$ ' + D.venda : 'não informada, me pergunte') + ' · teto de lance: ' + (D.teto ? 'R$ ' + D.teto : 'não informado') + ' · outros custos previstos: ' + (D.custos ? 'R$ ' + D.custos : 'não informados') + ' · comissão: ' + D.comissao + '%.' : '',
+      'Para cada item: OK, Atenção ou Reprovado, nota de 0 a 10, o que você viu e o custo extra de reparo' + (D.temGastos ? ' além do já previsto na aba Gastos.' : '.'),
       'No fim: nota geral (itens críticos com peso 3), veredito (Seguir para o leilão / Seguir com teto reduzido / Desistir do lote), ' +
-        'lance máximo pela fórmula da planilha com lucro mínimo de R$ 8.000, e o que eu ainda preciso olhar aqui no pátio.',
+        (D.temGastos ? 'lance máximo pela fórmula da planilha' : 'lance máximo = (venda − custos previstos − reparos − lucro mínimo) dividido por (1 + comissão)') + ', com lucro mínimo de R$ ' + (D.lucroMinimo || 8000) + ', e o que eu ainda preciso olhar aqui no pátio.',
       pend.length ? 'Itens ainda sem foto: ' + pend.join(', ') + '.' : '',
       pul.length ? 'Itens pulados: ' + pul.join('; ') + '.' : '',
       meus.length ? 'Minhas anotações: ' + meus.join('; ') + '.' : '',
-      'Depois grave o resultado de cada item na aba Visitação (colunas H e I) da planilha.'
+      D.temVisitacao ? 'Depois grave o resultado de cada item na aba Visitação (colunas H e I) da planilha.' : 'Depois grave o resultado de cada item na aba Vistoria_App da planilha.'
     ].filter(String).join('\n');
   }
   function linkClaude() { return 'https://claude.ai/new?q=' + encodeURIComponent(mensagemClaude()); }
@@ -468,6 +476,7 @@
     if (S.semAcesso || !ACESSO) return renderSemAcesso();
     if (!BOOT) return renderSemBoot();
     if (S.tela === 'ajustes') return renderAjustes();
+    if (S.tela === 'veiculos') return renderVeiculos();
     if (S.tela === 'item') return renderItem();
     if (S.tela === 'final') return renderFinal();
     return renderDash();
@@ -529,7 +538,9 @@
       '<main><div class="card">' +
       barra('Itens concluídos', feitos, TOTAL) + barra('Fotos enviadas', enviadas, FOTOS_TOTAL) +
       '<div class="prog"><div class="rot"><span>Fotos pendentes de envio</span><b class="' + (pend ? 'c-at' : 'c-ok') + '">' + pend + '</b></div></div>' +
-      '</div>' + htmlBannerAtualizacao() + resumo + html + '</main>' +
+      '</div>' + htmlBannerAtualizacao() +
+      '<button class="it" data-acao="veiculos"><span class="em">🚗</span><span class="tx"><div class="nm">' + esc(OP.modelo) + ' · ' + esc(OP.placa) + '</div>' +
+      '<div class="ds">Trocar de carro ou cadastrar outro</div></span></button>' + resumo + html + '</main>' +
       '<div class="rodape"><div class="dentro">' +
       '<button class="btn pri" data-acao="continuar">' + (feitos >= TOTAL ? 'Revisar vistoria' : 'Continuar vistoria') + '</button>' +
       '<div class="lado"><button class="btn sec peq" data-acao="final">Finalizar</button>' + htmlBotaoClaude('sec peq', 'Claude') +
@@ -678,7 +689,9 @@
       '<div class="veredito ' + corV + '">' + esc(f.veredito) + '</div></div>';
     out += '<div class="card"><p class="como" style="margin-top:0">O relatório completo (itens, fotos e anotações) já está na pasta do Drive. ' +
       'Toque em <b>Analisar com o Claude</b>: ele lê tudo, dá nota a cada item e calcula o lance, sem custo.</p>' +
-      '<div class="kv"><span>Lance máximo pela planilha' + (Number(f.custo_extra_max) ? '' : ' (sem reparos extras)') + '</span><b class="c-ouro">' + brl(f.lance_max) + '</b></div>' +
+      (f.lance_max === null
+        ? '<div class="kv"><span>Lance máximo</span><b class="c-2">Informe o preço de venda no cadastro do carro</b></div>'
+        : '<div class="kv"><span>Lance máximo' + (Number(f.custo_extra_max) ? '' : ' (sem reparos extras)') + '</span><b class="c-ouro">' + brl(f.lance_max) + '</b></div>') +
       (Number(f.custo_extra_max) ? '<div class="kv"><span>Custo extra de reparo</span><b>' + brl(f.custo_extra_min) + ' a ' + brl(f.custo_extra_max) + '</b></div>' : '') +
       '</div>';
     out += '<div class="area">O que mais precisa ver</div><div class="card"><ol class="lista">' +
@@ -716,6 +729,75 @@
       '<p class="como">Na primeira vez o app precisa de internet para baixar o checklist. Depois ele abre mesmo sem sinal.</p>' +
       (S.erroBoot ? '<div class="aviso-foto">' + esc(S.erroBoot) + '</div><button class="btn pri" data-acao="tentarBoot">Tentar de novo</button>' : '<span class="giro"></span>') +
       '</div></main>';
+  }
+
+  // --- Carros: trocar, cadastrar e editar
+  function renderVeiculos() {
+    var lista = (BOOT.veiculos || []).map(function (c) {
+      var atual = c.placa === OP.placa;
+      return '<button class="it" data-acao="trocarVeiculo" data-placa="' + esc(c.placa) + '" data-padrao="' + (c.padrao ? '1' : '') + '"><span class="em">' + (atual ? '✅' : '🚗') + '</span>' +
+        '<span class="tx"><div class="nm">' + esc(c.modelo) + ' · ' + esc(c.placa) + '</div><div class="ds">' + (atual ? 'Carro aberto agora' : 'Toque para abrir') + '</div></span></button>';
+    }).join('');
+    var D = BOOT.veiculo || {};
+    app.innerHTML = topo('Carros', 'Cada carro tem a própria vistoria', true) +
+      '<main><div class="area">Seus carros</div>' + lista +
+      '<button class="btn pri" data-acao="novoVeiculo">+ Cadastrar outro carro</button>' +
+      (D.padrao ? '' : '<button class="btn sec peq" style="margin-top:8px" data-acao="editarVeiculo">Editar dados deste carro</button>') +
+      '<div id="formVeiculo">' + (S.formVeiculo ? htmlFormVeiculo(S.formVeiculo) : '') + '</div></main>';
+  }
+  function campoVeiculo(k, rotulo, valor, extra) {
+    return '<label class="cap" for="fv_' + k + '">' + rotulo + '</label><input type="text" id="fv_' + k + '" value="' + esc(valor == null ? '' : valor) + '" autocomplete="off" ' + (extra || '') + '>';
+  }
+  function htmlFormVeiculo(d) {
+    var novo = !d.placa;
+    return '<div class="area">' + (novo ? 'Novo carro' : 'Editar carro') + '</div><div class="card">' +
+      campoVeiculo('placa', 'Placa *', d.placa, 'placeholder="ABC1D23" autocapitalize="characters"' + (novo ? '' : ' disabled')) +
+      campoVeiculo('modelo', 'Modelo e ano *', d.modelo, 'placeholder="Onix 2019"') +
+      '<p class="como" style="margin:10px 0 0">Só placa e modelo são obrigatórios. O resto ajuda na análise e pode ser preenchido depois.</p>' +
+      campoVeiculo('descricao', 'Descrição completa', d.descricao === d.modelo ? '' : d.descricao, 'placeholder="Chevrolet Onix 1.0 LT 2019 prata"') +
+      campoVeiculo('chassi', 'Chassi', d.chassi, 'autocapitalize="characters"') +
+      campoVeiculo('motor', 'Número do motor', d.motor, 'autocapitalize="characters"') +
+      campoVeiculo('renavam', 'RENAVAM', d.renavam, 'inputmode="numeric"') +
+      campoVeiculo('leilao', 'Leilão, lote e data', d.leilao, 'placeholder="Lote 12 · Leiloeiro · 20/11"') +
+      campoVeiculo('danoConhecido', 'Dano conhecido', d.danoConhecido, 'placeholder="Traseira amassada, conforme o anúncio"') +
+      '<label class="cap" for="fv_ladoBatida">Batida na dianteira</label><select id="fv_ladoBatida">' +
+      [['', 'Não sei / sem batida'], ['esquerda', 'Lado esquerdo'], ['direita', 'Lado direito']].map(function (o) {
+        return '<option value="' + o[0] + '"' + ((d.ladoBatida || '') === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
+      }).join('') + '</select>' +
+      campoVeiculo('venda', 'Preço de venda previsto (R$)', d.venda, 'inputmode="numeric"') +
+      campoVeiculo('teto', 'Teto de lance (R$)', d.teto, 'inputmode="numeric"') +
+      campoVeiculo('custos', 'Outros custos previstos, sem a compra (R$)', d.custos, 'inputmode="numeric"') +
+      campoVeiculo('comissao', 'Comissão do leiloeiro (%)', d.comissao == null || d.comissao === '' ? 5 : d.comissao, 'inputmode="numeric"') +
+      campoVeiculo('lucroMinimo', 'Lucro mínimo desejado (R$)', d.lucroMinimo == null || d.lucroMinimo === '' ? 8000 : d.lucroMinimo, 'inputmode="numeric"') +
+      '<button class="btn pri" style="margin-top:12px" data-acao="salvarVeiculo">Salvar e abrir este carro</button>' +
+      (novo ? '' : '<button class="btn sec peq" style="margin-top:8px" data-acao="removerVeiculo">Remover este carro da lista</button>') +
+      '</div>';
+  }
+  function abrirVeiculo(placa, padrao) {
+    if (fotosPendentes()) { toast('Espere as fotos deste carro subirem antes de trocar.'); return; }
+    if (padrao) { try { localStorage.removeItem(CHAVE_VEICULO); } catch (e) { /* segue */ } }
+    else gravarLS(CHAVE_VEICULO, placa);
+    location.reload();
+  }
+  function salvarVeiculo() {
+    if (S.salvandoVeiculo) return;
+    if (!navigator.onLine) { toast('Para cadastrar um carro é preciso internet.'); return; }
+    var d = {};
+    ['placa', 'modelo', 'descricao', 'chassi', 'motor', 'renavam', 'leilao', 'danoConhecido', 'ladoBatida', 'venda', 'teto', 'custos', 'comissao', 'lucroMinimo'].forEach(function (k) {
+      d[k] = document.getElementById('fv_' + k).value.trim();
+    });
+    if (!d.placa || !d.modelo) { toast('Preencha a placa e o modelo.'); return; }
+    if (fotosPendentes()) { toast('Espere as fotos deste carro subirem antes de trocar.'); return; }
+    S.salvandoVeiculo = true;
+    var b = document.querySelector('[data-acao="salvarVeiculo"]');
+    if (b) { b.disabled = true; b.textContent = 'Salvando…'; }
+    rpc('salvarVeiculo', d).then(function (r) {
+      abrirVeiculo(r.placa, false);
+    }).catch(function (e) {
+      S.salvandoVeiculo = false;
+      if (b) { b.disabled = false; b.textContent = 'Salvar e abrir este carro'; }
+      toast(e.message);
+    });
   }
 
   // --- Ajustes (versão, atalhos e recomeçar)
@@ -757,6 +839,7 @@
       var primeira = !BOOT;
       aplicarBoot(b);
       if (primeira) render();
+      else if (S.tela === 'dash') renderDash();                 // checklist pode ter mudado (carro editado)
     }).catch(function (e) {
       if (!BOOT) { S.erroBoot = 'Não consegui baixar o checklist: ' + e.message; render(); }
     });
@@ -804,6 +887,28 @@
     if (a === 'continuar') { var p = proximoPendente(0); return navegar('item', p || 1); }
     if (a === 'final') return navegar('final');
     if (a === 'ajustes') return navegar('ajustes');
+    if (a === 'veiculos') { S.formVeiculo = null; navegar('veiculos'); carregarBoot().then(function () { if (S.tela === 'veiculos' && !S.formVeiculo) renderVeiculos(); }); return; }
+    if (a === 'trocarVeiculo') {
+      if (b.getAttribute('data-placa') === OP.placa) return navegar('dash');
+      return abrirVeiculo(b.getAttribute('data-placa'), !!b.getAttribute('data-padrao'));
+    }
+    if (a === 'novoVeiculo' || a === 'editarVeiculo') {
+      S.formVeiculo = a === 'novoVeiculo' ? {} : BOOT.veiculo;
+      document.getElementById('formVeiculo').innerHTML = htmlFormVeiculo(S.formVeiculo);
+      document.getElementById('formVeiculo').scrollIntoView();
+      return;
+    }
+    if (a === 'salvarVeiculo') return salvarVeiculo();
+    if (a === 'removerVeiculo') {
+      if (!navigator.onLine) { toast('Para remover um carro é preciso internet.'); return; }
+      if (fotosPendentes()) { toast('Espere as fotos deste carro subirem antes de remover.'); return; }
+      if (!window.confirm('Remover ' + OP.modelo + ' (' + OP.placa + ') da lista? Se já tiver fotos, elas e a planilha continuam no Drive.')) return;
+      rpc('removerVeiculo', OP.placa).then(function () {
+        try { localStorage.removeItem(CHAVE_BOOT); } catch (e) { /* segue */ }
+        abrirVeiculo('', true);
+      }).catch(function (e) { toast(e.message); });
+      return;
+    }
     if (a === 'atualizarTudo') return atualizarTudo();
     if (a === 'claude') {
       // o link abre o app do Claude com a mensagem pronta; a mensagem também vai para a área de transferência

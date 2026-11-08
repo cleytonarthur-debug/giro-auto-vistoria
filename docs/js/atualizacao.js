@@ -5,8 +5,8 @@
    VERSAO e DATA são trocados pelo script tools/versao.mjs a cada publicação. */
 window.Atualizacao = (function () {
   'use strict';
-  var VERSAO = "1.1.0";
-  var DATA = "25/10/2026";
+  var VERSAO = "1.2.0";
+  var DATA = "08/11/2026";
 
   // compara "1.0.10" com "1.0.9" número a número
   function cmp(a, b) {
