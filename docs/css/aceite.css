@@ -1,0 +1,35 @@
+/* Página do cliente (aceite da entrega) */
+body.aceite main { padding-bottom: 40px; }
+body.aceite .topo { position: static; }
+.card.item .lin { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+.card.item .obs { margin: 6px 0 0; color: var(--laranja); font-size: 15px; }
+.card.item .galeria { flex-wrap: wrap; }
+.card.item .galeria img { width: 96px; height: 96px; cursor: zoom-in; }
+.card.ok { text-align: center; border-color: var(--verde); }
+.kv small { color: var(--texto2); font-weight: 400; }
+.marca-check { display: flex; gap: 10px; align-items: flex-start; margin: 14px 0 4px; font-size: 15px; line-height: 1.35; cursor: pointer; }
+.marca-check input { width: 24px; height: 24px; flex: 0 0 24px; margin: 0; accent-color: var(--ouro); }
+.btn.assinar { min-height: 90px; border: 2px dashed var(--ouro); color: var(--ouro); font-size: 18px; margin-top: 12px; }
+.assin-previa { display: block; width: 100%; max-height: 140px; object-fit: contain; background: #fff; border-radius: 12px; padding: 6px; }
+details.fotos { margin: 12px 0; }
+details.fotos summary { cursor: pointer; background: var(--card2); border: 1px solid var(--borda); border-radius: var(--raio); padding: 14px; font-weight: 700; color: var(--ouro); margin-bottom: 8px; }
+body.sem-rolar { overflow: hidden; }
+.tela-assin { position: fixed; inset: 0; z-index: 90; background: #fff; display: flex; flex-direction: column; }
+.tela-assin canvas { flex: 1 1 auto; width: 100%; min-height: 0; touch-action: none; display: block; }
+.tela-assin .dica-assin { color: #666; font-size: 14px; text-align: center; padding: calc(8px + env(safe-area-inset-top)) 8px 4px; }
+.tela-assin .linha-assin { position: absolute; left: 6%; right: 6%; bottom: 30%; border-bottom: 2px dashed #bbb; pointer-events: none; }
+.tela-assin .barra-assin { display: flex; gap: 8px; padding: 8px 8px calc(8px + env(safe-area-inset-bottom)); background: #f2f2f2; }
+.tela-assin .barra-assin button { flex: 1 1 0; min-height: 52px; border-radius: 12px; border: 1px solid #ccc; background: #fff; color: #111; font-weight: 700; font-size: 16px; }
+.tela-assin .barra-assin .salvar { background: var(--ouro); border-color: var(--ouro); color: #14110A; }
+@media (orientation: landscape) { .tela-assin .dica-assin span { display: none; } }
+.zoom { position: fixed; inset: 0; z-index: 80; background: rgba(0,0,0,.92); display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 12px; }
+.zoom img { max-width: 100%; max-height: 85vh; object-fit: contain; border-radius: 8px; }
+.zoom .dica { color: #ddd; margin-top: 10px; font-size: 14px; }
+
+/* Comprovante: imprime em fundo branco */
+@media print {
+  :root { --fundo: #fff; --card: #fff; --card2: #eee; --cab: #fff; --texto: #111; --texto2: #555; --borda: #ccc; --ouro: #7a5c00; }
+  .naoimprime, .zoom { display: none !important; }
+  .card { break-inside: avoid; }
+  .card.item .galeria img { width: 80px; height: 80px; }
+}

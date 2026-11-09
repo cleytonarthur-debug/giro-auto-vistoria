@@ -128,3 +128,21 @@
            padding: 12px 14px; border-radius: 12px; text-align: center; font-size: 15px; max-width: 520px; margin: 0 auto; }
   .giro { display: inline-block; width: 18px; height: 18px; border: 3px solid var(--card2); border-top-color: var(--ouro); border-radius: 50%; animation: g 1s linear infinite; vertical-align: middle; }
   @keyframes g { to { transform: rotate(360deg); } }
+
+  /* Aba lateral (vistoria de compra × locação) */
+  .topo .menu { flex: 0 0 auto; background: none; border: 1px solid var(--borda); border-radius: 12px; color: var(--ouro); font-size: 22px; min-width: 48px; min-height: 48px; cursor: pointer; }
+  .modal.lateral { align-items: stretch; justify-content: flex-start; }
+  .gaveta { background: var(--card); width: 84%; max-width: 340px; height: 100%; padding: 18px 14px calc(18px + env(safe-area-inset-bottom)); display: flex; flex-direction: column; gap: 4px; overflow-y: auto; }
+  html.apk .gaveta { padding-top: calc(18px + max(env(safe-area-inset-top, 0px), 30px)); }
+  .gaveta .marca { font-weight: 800; letter-spacing: .06em; color: var(--ouro); margin-bottom: 12px; }
+  .gaveta .it.atual { border-color: var(--ouro); }
+
+  /* Locação: grade de fotos do item */
+  .grade { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .fotoL { position: relative; aspect-ratio: 1; border-radius: 10px; overflow: hidden; background: var(--card2); display: flex; align-items: center; justify-content: center; }
+  .fotoL img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .fotoL small { position: absolute; left: 4px; bottom: 4px; background: rgba(0,0,0,.6); border-radius: 6px; padding: 1px 6px; font-size: 13px; }
+  .fotoL .tirar { position: absolute; top: 4px; right: 4px; width: 32px; height: 32px; border-radius: 50%; border: 0; background: rgba(0,0,0,.65); color: #fff; font-size: 20px; line-height: 1; cursor: pointer; }
+  .fotoL.nova { flex-direction: column; gap: 4px; border: 2px dashed var(--ouro); color: var(--ouro); font-weight: 700; font-size: 14px; cursor: pointer; }
+  .fotoL.nova .ic { font-size: 30px; line-height: 1; }
+  .fotoL.nova input { position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%; cursor: pointer; }

@@ -8,6 +8,7 @@
   var CHAVE_ACESSO = 'gav-acesso', CHAVE_VEICULO = 'gav-veiculo';
   // null = carro padrão. Cada carro tem os próprios dados no celular (checklist, fotos e fila).
   var VEICULO = lerLS(CHAVE_VEICULO);
+  var MODO = lerLS('gav-modo') === 'locacao' ? 'locacao' : 'vistoria';   // aba lateral: vistoria de compra ou locação
   var CHAVE_BOOT = VEICULO ? 'gav-boot-' + VEICULO : 'gav-boot';
   function aplicarBoot(b) {
     BOOT = b; CK = b.checklist; TOTAL = CK.length; OP = b.operacao;
@@ -260,6 +261,7 @@
   function atualizarTudo() {
     if (S.atualizandoTudo) return;
     if (!navigator.onLine) { toast('Sem internet. As fotos ficam guardadas e sobem quando o sinal voltar.'); return; }
+    if (MODO === 'locacao' && window.Locacao) return window.Locacao.atualizarTudo();
     S.atualizandoTudo = true; atualizar();
     processarFila();
     var versao = window.Atualizacao ? window.Atualizacao.verificar().catch(function () { return null; }) : Promise.resolve(null);
@@ -452,8 +454,9 @@
     if (tela === 'final') gerarFinal();
   }
 
+  function htmlBtnMenu() { return ACESSO ? '<button class="menu" data-acao="menu" aria-label="Menu">☰</button>' : ''; }
   function topo(titulo, sub, voltar) {
-    return '<header class="topo"><div class="linha">' + (voltar ? '<button class="voltar" data-acao="dash">‹ Lista</button>' : '') +
+    return '<header class="topo"><div class="linha">' + (voltar ? '<button class="voltar" data-acao="dash">‹ Lista</button>' : htmlBtnMenu()) +
       '<div style="flex:1 1 auto;min-width:0"><div class="marca">' + titulo + '</div>' + (sub ? '<div class="sub">' + sub + '</div>' : '') + '</div>' +
       (BOOT && ACESSO ? '<button class="atualizar" id="btnAtualizar" data-acao="atualizarTudo" aria-label="Atualizar">' + htmlBtnAtualizar() + '</button>' : '') +
       '</div><div id="pills">' + htmlPills() + '</div></header>';
@@ -474,6 +477,7 @@
 
   function render() {
     if (S.semAcesso || !ACESSO) return renderSemAcesso();
+    if (MODO === 'locacao' && window.Locacao) return window.Locacao.render();
     if (!BOOT) return renderSemBoot();
     if (S.tela === 'ajustes') return renderAjustes();
     if (S.tela === 'veiculos') return renderVeiculos();
@@ -484,6 +488,7 @@
 
   /** Atualização "leve" (polling, envio): não apaga o que o usuário está digitando. */
   function atualizar() {
+    if (MODO === 'locacao' && window.Locacao && !S.semAcesso && ACESSO) return window.Locacao.atualizar();
     if (S.semAcesso || !ACESSO || !BOOT) return render();
     if (S.tela === 'ajustes') { var aj = document.getElementById('ajustes'); if (aj) aj.innerHTML = htmlAjustes(); }
     var p = document.getElementById('pills');
@@ -856,7 +861,28 @@
       '<button class="btn sec" style="margin-top:12px" data-acao="fecharModal">Cancelar</button></div>';
     m.classList.remove('oculto');
   }
-  function fecharModal() { var m = document.getElementById('modal'); m.classList.add('oculto'); m.innerHTML = ''; }
+  // ------------------------------------------------------------ aba lateral (vistoria de compra × locação)
+  function abrirMenu() {
+    var m = document.getElementById('modal');
+    var op = function (v, ic, tt, ds) {
+      return '<button class="it' + (MODO === v ? ' atual' : '') + '" data-acao="modo" data-v="' + v + '"><span class="em">' + ic + '</span><span class="tx"><div class="nm">' + tt +
+        '</div><div class="ds">' + ds + '</div></span>' + (MODO === v ? '<span class="c-ouro">✓</span>' : '') + '</button>';
+    };
+    m.innerHTML = '<div class="gaveta"><div class="marca">GIRO AUTO</div>' +
+      op('vistoria', '🔎', 'Vistoria de compra', 'Checklist de carro de leilão no pátio') +
+      op('locacao', '🔑', 'Locação · entregas', 'Checklist de entrega e aceite do cliente') +
+      '<button class="btn sec peq" style="margin-top:auto" data-acao="fecharModal">Fechar</button></div>';
+    m.classList.remove('oculto'); m.classList.add('lateral');
+  }
+  function trocarModo(v) {
+    fecharModal();
+    if (v === MODO) return;
+    MODO = v; gravarLS('gav-modo', v);
+    window.scrollTo(0, 0);
+    if (v === 'vistoria') { S.tela = 'dash'; if (BOOT) { iniciarVistoria(); render(); } else { render(); carregarBoot().then(function () { if (BOOT) iniciarVistoria(); }); } }
+    else render();
+  }
+  function fecharModal() { var m = document.getElementById('modal'); m.classList.add('oculto'); m.classList.remove('lateral'); m.innerHTML = ''; }
   function pular(motivo) {
     fecharModal();
     var n = S.n, d = lerCamposItem();
@@ -879,9 +905,12 @@
 
   // ------------------------------------------------------------ eventos
   document.addEventListener('click', function (ev) {
+    if (ev.target.id === 'modal' && ev.target.classList.contains('lateral')) return fecharModal();   // toque fora da aba fecha
     var b = ev.target.closest('[data-acao]');
     if (!b) return;
     var a = b.getAttribute('data-acao');
+    if (a === 'menu') return abrirMenu();
+    if (a === 'modo') return trocarModo(b.getAttribute('data-v'));
     if (a === 'abrir') return navegar('item', Number(b.getAttribute('data-n')));
     if (a === 'dash') { if (S.tela === 'item') return sairDoItem(function () { navegar('dash'); }); return navegar('dash'); }
     if (a === 'continuar') { var p = proximoPendente(0); return navegar('item', p || 1); }
@@ -973,15 +1002,15 @@
   window.addEventListener('beforeinstallprompt', function (ev) { ev.preventDefault(); S.instalar = ev; atualizar(); });
   window.addEventListener('appinstalled', function () { S.instalar = null; atualizar(); });
   document.addEventListener('visibilitychange', function () {
-    if (document.visibilityState === 'visible') { processarFila(); carregarEstado(); }
+    if (document.visibilityState === 'visible') { processarFila(); if (MODO === 'vistoria') carregarEstado(); }
   });
 
   // Polling a cada 4 s enquanto houver item "em análise"
   setInterval(function () {
-    if (BOOT && navigator.onLine && document.visibilityState === 'visible' && emAnalise()) carregarEstado();
+    if (MODO === 'vistoria' && BOOT && navigator.onLine && document.visibilityState === 'visible' && emAnalise()) carregarEstado();
   }, 4000);
   // Reconciliação lenta (itens travados, IA ligada depois)
-  setInterval(function () { if (BOOT && navigator.onLine && document.visibilityState === 'visible') carregarEstado(); }, 60000);
+  setInterval(function () { if (MODO === 'vistoria' && BOOT && navigator.onLine && document.visibilityState === 'visible') carregarEstado(); }, 60000);
 
   // ------------------------------------------------------------ início
   var iniciada = false;
@@ -1001,6 +1030,11 @@
     gravarLS('gav-apk', !!window.Capacitor || /[?&]k=/.test(location.search) || lerLS('gav-apk'));
   }
   ACESSO = lerAcesso();
+  // A locação (js/locacao.js) usa o mesmo acesso, a mesma compressão de foto e os mesmos avisos
+  window.GA = {
+    acesso: function () { return ACESSO; }, toast: toast, esc: esc, comprimir: comprimir, blobParaBase64: blobParaBase64,
+    btnMenu: htmlBtnMenu, semChave: function () { S.semAcesso = true; render(); }, versao: function () { return window.Atualizacao; }
+  };
   var bootGuardado = lerLS(CHAVE_BOOT);
   if (bootGuardado) aplicarBoot(bootGuardado);
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(function () {});
@@ -1015,6 +1049,7 @@
     ]);
   }).then(function () {
     if (!ACESSO) return render();
+    if (MODO === 'locacao') { render(); processarFila(); buscarAtualizacao(); return; }   // vistoria carrega quando ele trocar de aba
     if (BOOT) { iniciarVistoria(); carregarBoot(); return; }   // checklist guardado: abre já, atualiza por trás
     render();
     return carregarBoot().then(function () { if (BOOT) iniciarVistoria(); });

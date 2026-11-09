@@ -1,8 +1,9 @@
 {
-  "versao": "1.2.0",
-  "data": "08/11/2026",
+  "versao": "1.3.0",
+  "data": "09/11/2026",
   "notas": [
-    "Serve para qualquer carro: cadastre e troque na tela de carros",
-    "Cada carro com vistoria, planilha e pasta próprias"
+    "Nova aba Locação: checklist de entrega com fotos no Drive",
+    "Cliente assina em tela cheia (S Pen) e aceita o termo de responsabilidade",
+    "Anexar contrato e documentos na pasta da entrega"
   ]
 }
